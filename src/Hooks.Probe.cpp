@@ -38,6 +38,7 @@
 #include <Fundamentals.h>
 
 #include <Syringe.h>
+#include <Utilities/Macro.h>
 #include <Utilities/Debug.h>
 
 namespace BunkerProbe
