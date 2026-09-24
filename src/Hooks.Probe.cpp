@@ -120,47 +120,6 @@ namespace BunkerProbe
 		return pRadio->RadioLinks.Capacity > 0 ? pRadio->RadioLinks[0] : nullptr;
 	}
 
-	// A deployed, grounded, unlinked, tagged unit of the bunker's own house —
-	// the post-deploy shape a deployer has after the Mission::Unload landed it.
-	static UnitClass* AdoptableUnit(ObjectClass* pFirst, BuildingClass* pBunker)
-	{
-		for (auto pObj = pFirst; pObj; pObj = pObj->NextObject)
-		{
-			if (pObj->WhatAmI() != AbstractType::Unit)
-				continue;
-			auto const pUnit = static_cast<UnitClass*>(pObj);
-			if (pUnit->Deployed && !pUnit->IsInAir()
-				&& !pUnit->BunkerLinkedItem
-				&& pUnit->Owner == pBunker->Owner
-				&& BunkerTags::DeployToEnter(pUnit->GetTechnoType()))
-			{
-				return pUnit;
-			}
-		}
-		return nullptr;
-	}
-
-	// A stationary, undeployed, tagged unit of the bunker's own house — a
-	// deployer that was ordered to the bunker and has arrived (hovering
-	// jumpjet or parked land vehicle). Gets the deploy order.
-	static UnitClass* AutoDeployCandidate(ObjectClass* pFirst, BuildingClass* pBunker)
-	{
-		for (auto pObj = pFirst; pObj; pObj = pObj->NextObject)
-		{
-			if (pObj->WhatAmI() != AbstractType::Unit)
-				continue;
-			auto const pUnit = static_cast<UnitClass*>(pObj);
-			if (!pUnit->Deployed && !pUnit->Deploying
-				&& !pUnit->BunkerLinkedItem
-				&& pUnit->Owner == pBunker->Owner
-				&& pUnit->Locomotor && !pUnit->Locomotor->Is_Moving()
-				&& BunkerTags::DeployToEnter(pUnit->GetTechnoType()))
-			{
-				return pUnit;
-			}
-		}
-		return nullptr;
-	}
 }
 
 // --- Probe A + Phase 1 gate: who gets asked "is bunkerable now". ------------
@@ -305,56 +264,85 @@ DEFINE_HOOK(0x458E50, BuildingClass_UpdateBunker_BunkerExtAdopt, 0x5)
 		return 0;
 	mem->lastAdoptScanFrame = frame;
 
-	auto const base = pThis->GetMapCoords();
+	// Global-array scan, NOT cell-object chains: air units (and jumpjets in
+	// several states) are absent from CellClass::FirstObject, which made the
+	// cell-based scan silently blind (run-4 lesson).
 	const int w = pThis->Type->GetFoundationWidth();
-	const int h = pThis->Type->GetFoundationHeight(false);
+	const int maxDist = w * 128 + range * 256 + 128; // leptons from center
 
-	for (int dx = -range; dx < w + range && dx < 3 + range; ++dx)
+	for (auto const pUnit : UnitClass::Array)
 	{
-		for (int dy = -range; dy < h + range && dy < 3 + range; ++dy)
+		if (pUnit->InLimbo || pUnit->BunkerLinkedItem
+			|| pUnit->Owner != pThis->Owner
+			|| !BunkerTags::DeployToEnter(pUnit->GetTechnoType()))
+			continue;
+		if (pUnit->DistanceFrom(pThis) > maxDist)
+			continue;
+
+		if (pUnit->Deployed)
 		{
-			auto const pCell = MapClass::Instance.TryGetCellAt(
-				CellStruct { static_cast<short>(base.X + dx),
-				             static_cast<short>(base.Y + dy) });
-			if (!pCell)
-				continue;
+			// Teleport onto the pad, then link; the Idle handler finishes
+			// (RaiseWalls) on this same UpdateBunker call.
+			auto dest = pThis->GetCoords();
+			dest.X += 128;
+			dest.Y += 128;
 
-			if (auto const pUnit = BunkerProbe::AdoptableUnit(pCell->FirstObject, pThis))
+			if (pUnit->Locomotor)
+				pUnit->Locomotor->Mark_All_Occupation_Bits(MarkType::Up);
+			pUnit->SetLocation(dest);
+			if (pUnit->Locomotor)
+				pUnit->Locomotor->Mark_All_Occupation_Bits(MarkType::Down);
+
+			pThis->BunkerLinkedItem = pUnit;
+			Debug::Log("[BunkerExt] f%d %s pulled in deployed %s (inAir=%d)\n",
+				frame, pThis->Type->ID, BunkerProbe::IdOf(pUnit), pUnit->IsInAir());
+			return 0;
+		}
+
+		// A tagged deployer that stopped next to the bunker (ordered in via
+		// the enter click, or just parked): give it the deploy order; the
+		// pull-in adopts it once it lands deployed.
+		const bool moving = pUnit->Locomotor && pUnit->Locomotor->Is_Moving();
+		if (!pUnit->Deploying && !moving)
+		{
+			if (frame - mem->lastDeployCmdFrame >= 45)
 			{
-				// Teleport onto the pad, then link; the Idle handler finishes
-				// (RaiseWalls) on this same UpdateBunker call.
-				auto dest = pThis->GetCoords();
-				dest.X += 128;
-				dest.Y += 128;
-
-				if (pUnit->Locomotor)
-					pUnit->Locomotor->Mark_All_Occupation_Bits(MarkType::Up);
-				pUnit->SetLocation(dest);
-				if (pUnit->Locomotor)
-					pUnit->Locomotor->Mark_All_Occupation_Bits(MarkType::Down);
-
-				pThis->BunkerLinkedItem = pUnit;
-				Debug::Log("[BunkerExt] f%d %s pulled in deployed %s from (%d,%d)\n",
-					frame, pThis->Type->ID, BunkerProbe::IdOf(pUnit), dx, dy);
-				return 0;
-			}
-
-			// No deployed unit here — but a tagged deployer that stopped next
-			// to the bunker (ordered in via the Move-action click, or just
-			// parked) gets the deploy order; the pull-in adopts it after it
-			// lands deployed.
-			if (auto const pUnit = BunkerProbe::AutoDeployCandidate(pCell->FirstObject, pThis))
-			{
-				if (frame - mem->lastDeployCmdFrame >= 45)
-				{
-					mem->lastDeployCmdFrame = frame;
-					pUnit->QueueMission(Mission::Unload, true);
-					Debug::Log("[BunkerExt] f%d %s auto-deploy order to %s at (%d,%d)\n",
-						frame, pThis->Type->ID, BunkerProbe::IdOf(pUnit), dx, dy);
-				}
+				mem->lastDeployCmdFrame = frame;
+				pUnit->QueueMission(Mission::Unload, true);
+				Debug::Log("[BunkerExt] f%d %s auto-deploy order to %s (inAir=%d)\n",
+					frame, pThis->Type->ID, BunkerProbe::IdOf(pUnit), pUnit->IsInAir());
 			}
 		}
+		else if (frame - mem->lastIdleLogFrame >= 150)
+		{
+			mem->lastIdleLogFrame = frame;
+			Debug::Log(
+				"[BunkerExt] f%d %s sees %s in range: deployed=%d deploying=%d"
+				" moving=%d inAir=%d dist=%d\n",
+				frame, pThis->Type->ID, BunkerProbe::IdOf(pUnit),
+				pUnit->Deployed, pUnit->Deploying, moving, pUnit->IsInAir(),
+				pUnit->DistanceFrom(pThis));
+		}
 	}
+
+	return 0;
+}
+
+// --- Phase 1d: lift the MovementZone=Fly veto on building-enter actions. ----
+// 0x74018D, in UnitClass::GetActionOnObject: vanilla forces Action::NoEnter
+// (31) for any unit with MovementZone=Fly right AFTER the target building
+// approved the enter (run-4 telemetry: SCHP baseAction=31 while MTNK got
+// Enter=3 through the same approvals). Tagged units skip the veto and
+// continue down the same path that grants land units Action::Enter.
+// Stolen bytes (6): 8b 86 c4 06 00 00 (mov eax,[esi+0x6c4]) — idempotent.
+DEFINE_HOOK(0x74018D, UnitClass_GetActionOnObject_BunkerExtFlyVeto, 0x6)
+{
+	enum { SkipFlyVeto = 0x7401A3 };
+
+	GET(TechnoClass*, pThis, ESI);
+
+	if (BunkerTags::DeployToEnter(pThis->GetTechnoType()))
+		return SkipFlyVeto;
 
 	return 0;
 }
@@ -389,12 +377,10 @@ DEFINE_HOOK(0x74022D, UnitClass_GetActionOnObject_BunkerExtEnterUX, 0x5)
 				frame, BunkerProbe::IdOf(pThis), pBld->Type->ID, action);
 		}
 
-		if (pBld->Type->Bunker && !pBld->BunkerLinkedItem
-			&& BunkerTags::DeployToEnter(pThis->GetTechnoType()))
-		{
-			R->EBX(1); // Action::Move — the same action vanilla grants MGTK
-			return Done;
-		}
+		// Telemetry only. The Move-force that lived here (phase 1c) clobbered
+		// the real fix: with the Fly-veto lifted at 0x74018D the action
+		// arriving here is already Enter(3) — pass it through untouched.
+		(void)pBld;
 	}
 
 	return action == 7 ? SelectBranch : NotSelect;
