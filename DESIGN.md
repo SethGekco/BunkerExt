@@ -71,3 +71,26 @@ Phase 1 until the log picks one.
 All three `return 0` (re-run stolen bytes). Logging is throttled: probe A by
 unit-change or 150 frames, probe B on state/link change only, probe C every
 30 frames per building.
+
+## Phase 0 verdict (2026-09-23, in-game probe + deployed-dll disassembly)
+
+- **MGTK** (turretless, Drive): full pipeline success with `BunkerableAnyway=yes`
+  — Idle→1..5→Bunkered at 15-frame ticks, hull tracks targets while bunkered.
+  **Turretless swivel needs no code.**
+- **SCHP** (Jumpjet): `IsBunkerableNow` fired with perfect flags, still
+  no-entry. Deployed Phobos Build #48's handler (RVA 0x2C900) gates on the
+  locomotor GUID (5 blocklist compares + allow test) BEFORE reading
+  `BunkerableAnyway` — Jumpjet fails, Drive passes. Newer Phobos source differs;
+  always disassemble the deployed dll, not the submodule.
+
+## Phase 1 (deployed 2026-09-23, untested)
+
+`Bunker.DeployToEnter=yes` on a VehicleType (lazy read from in-memory rules
+INI). Flow: entry hook 0x70FB50 grants bunkerable via ret-gadget 0x70FBCA →
+vanilla enter mission flies the jumpjet in (radio link) → Idle hook orders
+Mission::Unload near the bunker (DeployToLand lands it; order drops radio) →
+dispatch hook adopts the deployed grounded unit on the foundation
+(BunkerLinkedItem) → Idle hook captures: link both ways, state := RaiseWalls(5),
+skipping drive-track states 2..4. Vanilla state 5 finalizes (per MGTK trace).
+Known deferred: undeploy-inside, bunker-destroyed-while-deployed ejection,
+map/gamemode INI overrides for the tag.
