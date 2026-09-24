@@ -84,6 +84,7 @@ namespace BunkerProbe
 		TechnoClass* link = nullptr;
 		int lastIdleLogFrame = -100000;
 		int lastDeployCmdFrame = -100000;
+		int lastAdoptScanFrame = -100000;
 	};
 
 	static constexpr size_t MaxTracked = 64;
@@ -245,35 +246,75 @@ DEFINE_HOOK(0x458E99, BuildingClass_UpdateBunker_BunkerExtProbe, 0x6)
 		}
 	}
 
-	// Phase 1: a deploy order breaks the entering unit's radio link, so an
-	// idle, linkless bunker adopts a deployed tagged unit standing on its
-	// foundation. Setting BunkerLinkedItem makes the pre-switch code hand it
-	// to the Idle handler on this same pass.
-	if (pThis->TankBunkerState == ::TankBunkerState::Idle
-		&& !pThis->BunkerLinkedItem && !BunkerProbe::FirstLink(pThis))
-	{
-		auto const base = pThis->GetMapCoords();
-		const int w = pThis->Type->GetFoundationWidth();
-		const int h = pThis->Type->GetFoundationHeight(false);
+	return 0;
+}
 
-		for (short dx = 0; dx < w && dx < 3; ++dx)
+// --- Phase 1b: adoption at UpdateBunker ENTRY. ------------------------------
+// 0x458E50 = BuildingClass::UpdateBunker entry (ECX=this). Stolen bytes (5):
+//   83 ec 78 / 53 / 55  (sub esp,0x78; push ebx; push ebp)  -- clean.
+//
+// This must run at the ENTRY: with no radio link and no BunkerLinkedItem the
+// function bails out before the state dispatch, so a hook at 0x458E99 never
+// sees a linkless bunker (run-3 lesson). Setting BunkerLinkedItem here means
+// the pre-switch code picks the unit up as the link in this very call, and
+// the Idle handler captures it.
+//
+// Vanilla vetoes force the pull-in design: a jumpjet refuses destinations on
+// a building and DeployToLand shuffles to clear ground, so the unit can
+// never legally stand ON the foundation. Instead it deploys NEXT to the
+// bunker and gets teleported in (loco occupation bits up -> SetLocation ->
+// bits down), matching where the MGTK trace showed the captured unit rests.
+DEFINE_HOOK(0x458E50, BuildingClass_UpdateBunker_BunkerExtAdopt, 0x5)
+{
+	GET(BuildingClass*, pThis, ECX);
+
+	if (pThis->TankBunkerState != ::TankBunkerState::Idle
+		|| pThis->BunkerLinkedItem || BunkerProbe::FirstLink(pThis))
+		return 0;
+
+	const int range = BunkerTags::DeployCaptureRange(pThis->Type);
+	if (range <= 0)
+		return 0;
+
+	auto* mem = BunkerProbe::Track(pThis);
+	const int frame = Unsorted::CurrentFrame;
+	if (!mem || frame - mem->lastAdoptScanFrame < 10)
+		return 0;
+	mem->lastAdoptScanFrame = frame;
+
+	auto const base = pThis->GetMapCoords();
+	const int w = pThis->Type->GetFoundationWidth();
+	const int h = pThis->Type->GetFoundationHeight(false);
+
+	for (int dx = -range; dx < w + range && dx < 3 + range; ++dx)
+	{
+		for (int dy = -range; dy < h + range && dy < 3 + range; ++dy)
 		{
-			for (short dy = 0; dy < h && dy < 3; ++dy)
-			{
-				auto const pCell = MapClass::Instance.TryGetCellAt(
-					CellStruct { static_cast<short>(base.X + dx),
-					             static_cast<short>(base.Y + dy) });
-				if (!pCell)
-					continue;
-				if (auto const pUnit = BunkerProbe::AdoptableUnit(pCell->FirstObject))
-				{
-					pThis->BunkerLinkedItem = pUnit;
-					Debug::Log("[BunkerExt] f%d %s adopted deployed %s\n",
-						Unsorted::CurrentFrame, pThis->Type->ID,
-						BunkerProbe::IdOf(pUnit));
-					return 0;
-				}
-			}
+			auto const pCell = MapClass::Instance.TryGetCellAt(
+				CellStruct { static_cast<short>(base.X + dx),
+				             static_cast<short>(base.Y + dy) });
+			if (!pCell)
+				continue;
+			auto const pUnit = BunkerProbe::AdoptableUnit(pCell->FirstObject);
+			if (!pUnit)
+				continue;
+
+			// Teleport onto the pad, then link; the Idle handler finishes
+			// (RaiseWalls) on this same UpdateBunker call.
+			auto dest = pThis->GetCoords();
+			dest.X += 128;
+			dest.Y += 128;
+
+			if (pUnit->Locomotor)
+				pUnit->Locomotor->Mark_All_Occupation_Bits(MarkType::Up);
+			pUnit->SetLocation(dest);
+			if (pUnit->Locomotor)
+				pUnit->Locomotor->Mark_All_Occupation_Bits(MarkType::Down);
+
+			pThis->BunkerLinkedItem = pUnit;
+			Debug::Log("[BunkerExt] f%d %s pulled in deployed %s from (%d,%d)\n",
+				frame, pThis->Type->ID, BunkerProbe::IdOf(pUnit), dx, dy);
+			return 0;
 		}
 	}
 
