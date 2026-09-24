@@ -147,6 +147,7 @@ DEFINE_HOOK(0x70FB50, FootClass_IsBunkerableNow_BunkerExtProbe, 0x5)
 	enum { RetTrue = 0x70FBCA }; // bare `ret`; AL already set, esi untouched
 
 	GET(FootClass*, pThis, ECX);
+	GET_STACK(unsigned int, retAddr, 0x0); // who asked: 0x43C517 / 0x43C86F / 0x4DFF54
 
 	BunkerProbe::Banner();
 
@@ -160,9 +161,9 @@ DEFINE_HOOK(0x70FB50, FootClass_IsBunkerableNow_BunkerExtProbe, 0x5)
 		BunkerProbe::lastQueriedFrame = frame;
 
 		Debug::Log(
-			"[BunkerExt] f%d IsBunkerableNow(%s): Bunkerable=%d Turret=%d"
+			"[BunkerExt] f%d IsBunkerableNow(%s) from %08X: Bunkerable=%d Turret=%d"
 			" SpeedType=%d LocoData1=%08X Parasite=%d tag=%d\n",
-			frame, pType->ID,
+			frame, pType->ID, retAddr,
 			pType->Bunkerable, pType->Turret,
 			static_cast<int>(pType->SpeedType),
 			static_cast<unsigned int>(pType->Locomotor.Data1),
@@ -182,6 +183,36 @@ DEFINE_HOOK(0x70FB50, FootClass_IsBunkerableNow_BunkerExtProbe, 0x5)
 	}
 
 	return 0;
+}
+
+// --- Probe D: what the building-side enter helper decides after a positive --
+// --- IsBunkerableNow. -------------------------------------------------------
+// 0x43C52C sits right after `ReceiveCommand(QueryOnBuilding, unit)` in the
+// helper at 0x43C4xx (caller of IsBunkerableNow at 0x43C512). Vanilla:
+// answer == AnswerPositive (already on top) -> 0x43CB68, else the helper
+// returns 1 ("may enter"). Stolen bytes are cmp+je (9 bytes) — a relative
+// branch, so this hook must NEVER return 0; both paths are explicit.
+DEFINE_HOOK(0x43C52C, BuildingClass_EnterHelper_QueryOnBuilding_BunkerExtProbe, 0x9)
+{
+	enum { OnTopPath = 0x43CB68, MayEnterPath = 0x43C535 };
+
+	GET(BuildingClass*, pThis, ESI);
+	GET(TechnoClass*, pUnit, EDI);
+	GET(int, answer, EAX);
+
+	static TechnoClass* lastUnit = nullptr;
+	static int lastFrame = -100000;
+	const int frame = Unsorted::CurrentFrame;
+	if (pUnit != lastUnit || frame - lastFrame > 150)
+	{
+		lastUnit = pUnit;
+		lastFrame = frame;
+		Debug::Log("[BunkerExt] f%d %s QueryOnBuilding(%s) = %d -> %s\n",
+			frame, pThis->Type->ID, BunkerProbe::IdOf(pUnit),
+			answer, answer == 1 ? "onTop-path" : "MAY-ENTER");
+	}
+
+	return answer == 1 ? OnTopPath : MayEnterPath;
 }
 
 // --- Probe B + Phase 1 adoption: bunker-side state watcher. -----------------
