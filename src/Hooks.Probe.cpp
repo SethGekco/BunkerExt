@@ -39,6 +39,7 @@
 // ---------------------------------------------------------------------------
 
 #include <BuildingClass.h>
+#include <HouseClass.h>
 #include <UnitClass.h>
 #include <FootClass.h>
 #include <TechnoTypeClass.h>
