@@ -85,6 +85,7 @@ namespace BunkerProbe
 		int lastIdleLogFrame = -100000;
 		int lastDeployCmdFrame = -100000;
 		int lastAdoptScanFrame = -100000;
+		int lastScanLogFrame = -100000;
 	};
 
 	static constexpr size_t MaxTracked = 64;
@@ -273,10 +274,27 @@ DEFINE_HOOK(0x458E50, BuildingClass_UpdateBunker_BunkerExtAdopt, 0x5)
 	for (auto const pUnit : UnitClass::Array)
 	{
 		if (pUnit->InLimbo || pUnit->BunkerLinkedItem
-			|| pUnit->Owner != pThis->Owner
 			|| !BunkerTags::DeployToEnter(pUnit->GetTechnoType()))
 			continue;
-		if (pUnit->DistanceFrom(pThis) > maxDist)
+
+		const int dist = pUnit->DistanceFrom(pThis);
+		const bool sameSide = pUnit->Owner == pThis->Owner
+			|| (pThis->Owner && pThis->Owner->IsAlliedWith(pUnit->Owner));
+
+		// Unconditional visibility: every tagged unit anywhere, with the exact
+		// reason it is or isn't eligible. This is the diagnostic that tells us
+		// whether owner or distance is the blocker (run-5 found nothing).
+		if (mem && frame - mem->lastScanLogFrame >= 120)
+		{
+			mem->lastScanLogFrame = frame;
+			Debug::Log(
+				"[BunkerExt] f%d %s scan sees %s: dist=%d (max=%d) sameSide=%d"
+				" deployed=%d deploying=%d inAir=%d\n",
+				frame, pThis->Type->ID, BunkerProbe::IdOf(pUnit), dist, maxDist,
+				sameSide, pUnit->Deployed, pUnit->Deploying, pUnit->IsInAir());
+		}
+
+		if (!sameSide || dist > maxDist)
 			continue;
 
 		if (pUnit->Deployed)
@@ -312,16 +330,6 @@ DEFINE_HOOK(0x458E50, BuildingClass_UpdateBunker_BunkerExtAdopt, 0x5)
 				Debug::Log("[BunkerExt] f%d %s auto-deploy order to %s (inAir=%d)\n",
 					frame, pThis->Type->ID, BunkerProbe::IdOf(pUnit), pUnit->IsInAir());
 			}
-		}
-		else if (frame - mem->lastIdleLogFrame >= 150)
-		{
-			mem->lastIdleLogFrame = frame;
-			Debug::Log(
-				"[BunkerExt] f%d %s sees %s in range: deployed=%d deploying=%d"
-				" moving=%d inAir=%d dist=%d\n",
-				frame, pThis->Type->ID, BunkerProbe::IdOf(pUnit),
-				pUnit->Deployed, pUnit->Deploying, moving, pUnit->IsInAir(),
-				pUnit->DistanceFrom(pThis));
 		}
 	}
 
