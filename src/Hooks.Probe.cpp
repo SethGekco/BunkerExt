@@ -252,16 +252,29 @@ DEFINE_HOOK(0x458E50, BuildingClass_UpdateBunker_BunkerExtAdopt, 0x5)
 {
 	GET(BuildingClass*, pThis, ECX);
 
+	auto* mem = BunkerProbe::Track(pThis);
+	const int frame = Unsorted::CurrentFrame;
+	const int range = BunkerTags::DeployCaptureRange(pThis->Type);
+
+	// Unconditional entry diagnostic (throttled): proves the hook fires at all
+	// and reports exactly which early-out (if any) suppresses the scan. This
+	// exists because "scan sees" never printed across six runs.
+	if (mem && frame - mem->lastScanLogFrame >= 120)
+	{
+		mem->lastScanLogFrame = frame;
+		Debug::Log("[BunkerExt] f%d %s adopt-entry: state=%d linked=%d firstLink=%d range=%d\n",
+			frame, pThis->Type->ID, static_cast<int>(pThis->TankBunkerState),
+			pThis->BunkerLinkedItem != nullptr,
+			BunkerProbe::FirstLink(pThis) != nullptr, range);
+	}
+
 	if (pThis->TankBunkerState != ::TankBunkerState::Idle
 		|| pThis->BunkerLinkedItem || BunkerProbe::FirstLink(pThis))
 		return 0;
 
-	const int range = BunkerTags::DeployCaptureRange(pThis->Type);
 	if (range <= 0)
 		return 0;
 
-	auto* mem = BunkerProbe::Track(pThis);
-	const int frame = Unsorted::CurrentFrame;
 	if (!mem || frame - mem->lastAdoptScanFrame < 10)
 		return 0;
 	mem->lastAdoptScanFrame = frame;
