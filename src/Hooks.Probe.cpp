@@ -361,12 +361,14 @@ DEFINE_HOOK(0x458E50, BuildingClass_UpdateBunker_BunkerExtAdopt, 0x5)
 // bunker on the field and SCHP hovering it). BuildingClass::AI runs every frame
 // for EVERY building, so the capture is driven from here and calls UpdateBunker
 // directly, which runs our Idle-capture hook regardless of the bunker's mission.
-// 0x43FE98 stolen bytes (6): 8b 86 20 05 00 00 (mov eax,[esi+0x520]) — clean,
-// idempotent, esi=building. Antares owns 0x43FE8E (reload) a few bytes earlier;
-// this sits clear of it.
-DEFINE_HOOK(0x43FE98, BuildingClass_AI_BunkerExtCapture, 0x6)
+// 0x43FB23 = BuildingClass::AI entry, chained after Phobos' same-address
+// radiation hook (BunkerExt injects later; both return 0). Earlier points
+// deeper in the function (0x43FE98 etc.) are gated by per-building branches
+// and silently never ran for an idle bunker. Stolen bytes (5):
+// 53 55 56 8b f1 (push ebx/ebp/esi; mov esi,ecx) — ECX=building at entry.
+DEFINE_HOOK(0x43FB23, BuildingClass_AI_BunkerExtCapture, 0x5)
 {
-	GET(BuildingClass*, pThis, ESI);
+	GET(BuildingClass*, pThis, ECX);
 
 	if (!pThis->Type->Bunker)
 		return 0;
