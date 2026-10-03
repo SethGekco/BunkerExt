@@ -87,6 +87,7 @@ namespace BunkerProbe
 		int lastDeployCmdFrame = -100000;
 		int lastAdoptScanFrame = -100000;
 		int lastScanLogFrame = -100000;
+		int lastEntryLogFrame = -100000;
 	};
 
 	static constexpr size_t MaxTracked = 64;
@@ -259,17 +260,21 @@ DEFINE_HOOK(0x458E50, BuildingClass_UpdateBunker_BunkerExtAdopt, 0x5)
 	// Unconditional entry diagnostic (throttled): proves the hook fires at all
 	// and reports exactly which early-out (if any) suppresses the scan. This
 	// exists because "scan sees" never printed across six runs.
-	if (mem && frame - mem->lastScanLogFrame >= 120)
+	if (mem && frame - mem->lastEntryLogFrame >= 120)
 	{
-		mem->lastScanLogFrame = frame;
+		mem->lastEntryLogFrame = frame;
 		Debug::Log("[BunkerExt] f%d %s adopt-entry: state=%d linked=%d firstLink=%d range=%d\n",
 			frame, pThis->Type->ID, static_cast<int>(pThis->TankBunkerState),
 			pThis->BunkerLinkedItem != nullptr,
 			BunkerProbe::FirstLink(pThis) != nullptr, range);
 	}
 
+	// Availability is Idle + no BunkerLinkedItem ONLY. A tank bunker keeps a
+	// non-null RadioLinks[0] even when empty (run-9: state=0 linked=0
+	// firstLink=1), so gating on FirstLink wrongly suppressed the scan on
+	// every empty-bunker frame — that was the silent early-out.
 	if (pThis->TankBunkerState != ::TankBunkerState::Idle
-		|| pThis->BunkerLinkedItem || BunkerProbe::FirstLink(pThis))
+		|| pThis->BunkerLinkedItem)
 		return 0;
 
 	if (range <= 0)
