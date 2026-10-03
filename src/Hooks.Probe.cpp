@@ -46,6 +46,7 @@
 #include <BuildingTypeClass.h>
 #include <CellClass.h>
 #include <MapClass.h>
+#include <Helpers/Cast.h>
 #include <Fundamentals.h>
 
 #include <Syringe.h>
@@ -355,73 +356,77 @@ DEFINE_HOOK(0x458E50, BuildingClass_UpdateBunker_BunkerExtAdopt, 0x5)
 	return 0;
 }
 
-// --- Phase 1e: per-frame capture driver in BuildingClass::AI. ---------------
-// The old scan lived in UpdateBunker (0x458E50), but UpdateBunker is mission-
-// gated — it does NOT tick for an empty idle bunker (run-11: adopt=0 with a
-// bunker on the field and SCHP hovering it). BuildingClass::AI runs every frame
-// for EVERY building, so the capture is driven from here and calls UpdateBunker
-// directly, which runs our Idle-capture hook regardless of the bunker's mission.
-// 0x43FB23 = BuildingClass::AI entry, chained after Phobos' same-address
-// radiation hook (BunkerExt injects later; both return 0). Earlier points
-// deeper in the function (0x43FE98 etc.) are gated by per-building branches
-// and silently never ran for an idle bunker. Stolen bytes (5):
-// 53 55 56 8b f1 (push ebx/ebp/esi; mov esi,ecx) — ECX=building at entry.
-DEFINE_HOOK(0x43FB23, BuildingClass_AI_BunkerExtCapture, 0x5)
+// --- Phase 1f: UNIT-side per-frame capture driver in UnitClass::Update. -----
+// Every building-side hook failed for the empty-bunker case:
+//   - UpdateBunker (0x458E50) is mission-gated — never ticks for an idle bunker.
+//   - 0x43FE98 is behind a per-building branch (jne 0x43FEBE) — never reached.
+//   - 0x43FB23 (BuildingClass::AI entry) is RAW-PATCHED back to original bytes
+//     by Phobos (Phobos.cpp:271, Patch::Apply_RAW) at startup, which clobbers
+//     the Syringe JMP and silently un-hooks us.
+// UnitClass::Update (0x7360C0, vtable slot 0x7F5CCC) runs every frame for every
+// unit, is unclaimed, and is not raw-patched (Phobos hooks live inside it at
+// 0x736234). Drive capture from the deployed unit: find a nearby empty friendly
+// Bunker=yes building, teleport onto its pad, link both ways, and call
+// UpdateBunker() directly so our Idle-capture hook finalizes (walls up).
+// Stolen bytes (5): 83 ec 20 53 55 (sub esp,0x20; push ebx; push ebp) — clean,
+// ECX=unit at entry (mov esi,ecx is at 0x7360C7, after the stolen window).
+DEFINE_HOOK(0x7360C0, UnitClass_Update_BunkerExtCapture, 0x5)
 {
-	GET(BuildingClass*, pThis, ECX);
+	GET(UnitClass*, pUnit, ECX);
 
-	if (!pThis->Type->Bunker)
+	if (pUnit->InLimbo)
 		return 0;
 
-	// Capture in progress / occupied: drive the state machine to completion.
-	if (pThis->BunkerLinkedItem)
+	// Already linked: drive our bunker's state machine to completion (the
+	// game's mission tick is unreliable for a directly-linked occupant), then
+	// stay out of the way once Bunkered.
+	if (pUnit->BunkerLinkedItem)
 	{
-		if (pThis->TankBunkerState != ::TankBunkerState::Bunkered)
-			pThis->UpdateBunker();
+		if (auto const pBld = abstract_cast<BuildingClass*>(pUnit->BunkerLinkedItem))
+			if (pBld->TankBunkerState != ::TankBunkerState::Bunkered)
+				pBld->UpdateBunker();
 		return 0;
 	}
 
-	if (pThis->TankBunkerState != ::TankBunkerState::Idle)
+	// Cheapest rejects first: only tagged, deployed units proceed.
+	if (!pUnit->Deployed || !BunkerTags::DeployToEnter(pUnit->GetTechnoType()))
 		return 0;
 
-	const int range = BunkerTags::DeployCaptureRange(pThis->Type);
-	if (range <= 0)
-		return 0;
-
-	auto* mem = BunkerProbe::Track(pThis);
 	const int frame = Unsorted::CurrentFrame;
-	if (!mem || frame - mem->lastAdoptScanFrame < 10)
-		return 0;
-	mem->lastAdoptScanFrame = frame;
+	static int lastLogFrame = -100000;
 
-	const int w = pThis->Type->GetFoundationWidth();
-	const int maxDist = w * 128 + range * 256 + 128;
-
-	for (auto const pUnit : UnitClass::Array)
+	for (auto const pBld : BuildingClass::Array)
 	{
-		if (pUnit->InLimbo || pUnit->BunkerLinkedItem
-			|| !BunkerTags::DeployToEnter(pUnit->GetTechnoType()))
+		if (!pBld->Type->Bunker || pBld->BunkerLinkedItem || pBld->InLimbo)
+			continue;
+		if (pBld->TankBunkerState != ::TankBunkerState::Idle)
 			continue;
 
-		const int dist = pUnit->DistanceFrom(pThis);
-		const bool sameSide = pUnit->Owner == pThis->Owner
-			|| (pThis->Owner && pThis->Owner->IsAlliedWith(pUnit->Owner));
+		const int range = BunkerTags::DeployCaptureRange(pBld->Type);
+		if (range <= 0)
+			continue;
 
-		if (frame - mem->lastScanLogFrame >= 60)
+		const int w = pBld->Type->GetFoundationWidth();
+		const int maxDist = w * 128 + range * 256 + 128;
+		const int dist = pUnit->DistanceFrom(pBld);
+		const bool sameSide = pUnit->Owner == pBld->Owner
+			|| (pBld->Owner && pBld->Owner->IsAlliedWith(pUnit->Owner));
+
+		if (frame - lastLogFrame >= 60)
 		{
-			mem->lastScanLogFrame = frame;
+			lastLogFrame = frame;
 			Debug::Log(
-				"[BunkerExt] f%d %s AI-scan sees %s: dist=%d (max=%d) sameSide=%d"
-				" deployed=%d deploying=%d inAir=%d\n",
-				frame, pThis->Type->ID, BunkerProbe::IdOf(pUnit), dist, maxDist,
-				sameSide, pUnit->Deployed, pUnit->Deploying, pUnit->IsInAir());
+				"[BunkerExt] f%d UnitCapture %s near %s: dist=%d (max=%d)"
+				" sameSide=%d\n",
+				frame, BunkerProbe::IdOf(pUnit), pBld->Type->ID, dist, maxDist,
+				sameSide);
 		}
 
-		if (!sameSide || dist > maxDist || !pUnit->Deployed)
+		if (!sameSide || dist > maxDist)
 			continue;
 
-		// Teleport onto the pad, link both ways, then drive the state machine.
-		auto dest = pThis->GetCoords();
+		// Teleport onto the pad, link both ways, drive the state machine.
+		auto dest = pBld->GetCoords();
 		dest.X += 128;
 		dest.Y += 128;
 		if (pUnit->Locomotor)
@@ -430,12 +435,12 @@ DEFINE_HOOK(0x43FB23, BuildingClass_AI_BunkerExtCapture, 0x5)
 		if (pUnit->Locomotor)
 			pUnit->Locomotor->Mark_All_Occupation_Bits(MarkType::Down);
 
-		pThis->BunkerLinkedItem = pUnit;
-		pUnit->BunkerLinkedItem = pThis;
-		pThis->TankBunkerState = ::TankBunkerState::Idle;
-		Debug::Log("[BunkerExt] f%d %s AI-capture %s -> driving UpdateBunker\n",
-			frame, pThis->Type->ID, BunkerProbe::IdOf(pUnit));
-		pThis->UpdateBunker();
+		pBld->BunkerLinkedItem = pUnit;
+		pUnit->BunkerLinkedItem = pBld;
+		pBld->TankBunkerState = ::TankBunkerState::Idle;
+		Debug::Log("[BunkerExt] f%d UnitCapture %s -> %s, driving UpdateBunker\n",
+			frame, BunkerProbe::IdOf(pUnit), pBld->Type->ID);
+		pBld->UpdateBunker();
 		return 0;
 	}
 
