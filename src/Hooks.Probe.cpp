@@ -355,6 +355,91 @@ DEFINE_HOOK(0x458E50, BuildingClass_UpdateBunker_BunkerExtAdopt, 0x5)
 	return 0;
 }
 
+// --- Phase 1e: per-frame capture driver in BuildingClass::AI. ---------------
+// The old scan lived in UpdateBunker (0x458E50), but UpdateBunker is mission-
+// gated — it does NOT tick for an empty idle bunker (run-11: adopt=0 with a
+// bunker on the field and SCHP hovering it). BuildingClass::AI runs every frame
+// for EVERY building, so the capture is driven from here and calls UpdateBunker
+// directly, which runs our Idle-capture hook regardless of the bunker's mission.
+// 0x43FE98 stolen bytes (6): 8b 86 20 05 00 00 (mov eax,[esi+0x520]) — clean,
+// idempotent, esi=building. Antares owns 0x43FE8E (reload) a few bytes earlier;
+// this sits clear of it.
+DEFINE_HOOK(0x43FE98, BuildingClass_AI_BunkerExtCapture, 0x6)
+{
+	GET(BuildingClass*, pThis, ESI);
+
+	if (!pThis->Type->Bunker)
+		return 0;
+
+	// Capture in progress / occupied: drive the state machine to completion.
+	if (pThis->BunkerLinkedItem)
+	{
+		if (pThis->TankBunkerState != ::TankBunkerState::Bunkered)
+			pThis->UpdateBunker();
+		return 0;
+	}
+
+	if (pThis->TankBunkerState != ::TankBunkerState::Idle)
+		return 0;
+
+	const int range = BunkerTags::DeployCaptureRange(pThis->Type);
+	if (range <= 0)
+		return 0;
+
+	auto* mem = BunkerProbe::Track(pThis);
+	const int frame = Unsorted::CurrentFrame;
+	if (!mem || frame - mem->lastAdoptScanFrame < 10)
+		return 0;
+	mem->lastAdoptScanFrame = frame;
+
+	const int w = pThis->Type->GetFoundationWidth();
+	const int maxDist = w * 128 + range * 256 + 128;
+
+	for (auto const pUnit : UnitClass::Array)
+	{
+		if (pUnit->InLimbo || pUnit->BunkerLinkedItem
+			|| !BunkerTags::DeployToEnter(pUnit->GetTechnoType()))
+			continue;
+
+		const int dist = pUnit->DistanceFrom(pThis);
+		const bool sameSide = pUnit->Owner == pThis->Owner
+			|| (pThis->Owner && pThis->Owner->IsAlliedWith(pUnit->Owner));
+
+		if (frame - mem->lastScanLogFrame >= 60)
+		{
+			mem->lastScanLogFrame = frame;
+			Debug::Log(
+				"[BunkerExt] f%d %s AI-scan sees %s: dist=%d (max=%d) sameSide=%d"
+				" deployed=%d deploying=%d inAir=%d\n",
+				frame, pThis->Type->ID, BunkerProbe::IdOf(pUnit), dist, maxDist,
+				sameSide, pUnit->Deployed, pUnit->Deploying, pUnit->IsInAir());
+		}
+
+		if (!sameSide || dist > maxDist || !pUnit->Deployed)
+			continue;
+
+		// Teleport onto the pad, link both ways, then drive the state machine.
+		auto dest = pThis->GetCoords();
+		dest.X += 128;
+		dest.Y += 128;
+		if (pUnit->Locomotor)
+			pUnit->Locomotor->Mark_All_Occupation_Bits(MarkType::Up);
+		pUnit->SetLocation(dest);
+		if (pUnit->Locomotor)
+			pUnit->Locomotor->Mark_All_Occupation_Bits(MarkType::Down);
+
+		pThis->BunkerLinkedItem = pUnit;
+		pUnit->BunkerLinkedItem = pThis;
+		pThis->TankBunkerState = ::TankBunkerState::Idle;
+		Debug::Log("[BunkerExt] f%d %s AI-capture %s -> driving UpdateBunker\n",
+			frame, pThis->Type->ID, BunkerProbe::IdOf(pUnit));
+		pThis->UpdateBunker();
+		return 0;
+	}
+
+	return 0;
+}
+
 // --- Phase 1d: lift the MovementZone=Fly veto on building-enter actions. ----
 // 0x74018D, in UnitClass::GetActionOnObject: vanilla forces Action::NoEnter
 // (31) for any unit with MovementZone=Fly right AFTER the target building
