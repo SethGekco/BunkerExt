@@ -62,8 +62,8 @@ namespace BunkerTags
 		int value = 1;
 		if (auto const pINI = CCINIClass::INI_Rules)
 			value = pINI->ReadInteger(pBldType->ID, "Bunker.DeployCaptureRange", 1);
-		if (value > 6)
-			value = 6;
+		if (value > 16)
+			value = 16;
 
 		cache[pBldType] = RangeEntry { pBldType->ID, value };
 		return value;
