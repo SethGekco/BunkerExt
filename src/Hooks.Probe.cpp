@@ -48,6 +48,7 @@
 #include <MapClass.h>
 #include <Helpers/Cast.h>
 #include <Fundamentals.h>
+#include <Dir.h>
 
 #include <Syringe.h>
 #include <Utilities/Macro.h>
@@ -553,13 +554,18 @@ DEFINE_HOOK(0x458EAF, BuildingClass_UpdateBunker_Idle_BunkerExtProbe, 0x5)
 
 		if (pUnit->Deployed && !pUnit->IsInAir())
 		{
-			// Landed and deployed on the bunker: capture in place. Skip the
-			// rotate/track states (2..4) and let vanilla state 5 raise the
-			// walls and finalize, as in the MGTK trace.
+			// Landed and deployed on the bunker. Skip the track states (2,3 —
+			// a jumpjet can't drive-track; the unit is already centered), but
+			// route through RotateInBunker(4), NOT straight to RaiseWalls(5):
+			// state 4 is what actually PLAYS the walls-up animation (run-14:
+			// jumping 0->5 set state=Bunkered but left the walls down). Pin the
+			// body facing to South with SetCurrent so state 4's IsRotating
+			// check passes at once (a deployed SCHP won't rotate its hull).
 			pThis->BunkerLinkedItem = pUnit;
 			pUnit->BunkerLinkedItem = pThis;
-			pThis->TankBunkerState = ::TankBunkerState::RaiseWalls;
-			Debug::Log("[BunkerExt] f%d %s captured deployed %s -> RaiseWalls\n",
+			pUnit->PrimaryFacing.SetCurrent(DirStruct(DirType::South));
+			pThis->TankBunkerState = ::TankBunkerState::RotateInBunker;
+			Debug::Log("[BunkerExt] f%d %s captured deployed %s -> RotateInBunker\n",
 				frame, pThis->Type->ID, BunkerProbe::IdOf(pUnit));
 		}
 		else if (!pUnit->Deploying)
