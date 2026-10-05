@@ -49,6 +49,8 @@
 #include <Helpers/Cast.h>
 #include <Fundamentals.h>
 #include <Dir.h>
+#include <JumpjetLocomotionClass.h>
+#include <LocomotionClass.h>
 
 #include <Syringe.h>
 #include <Utilities/Macro.h>
@@ -385,7 +387,14 @@ DEFINE_HOOK(0x7360C0, UnitClass_Update_BunkerExtCapture, 0x5)
 	{
 		if (auto const pBld = abstract_cast<BuildingClass*>(pUnit->BunkerLinkedItem))
 			if (pBld->TankBunkerState != ::TankBunkerState::Bunkered)
+			{
+				// Keep the unit grounded through the 4->5->6 frames — the
+				// jumpjet loco would otherwise re-raise its flight height.
+				pUnit->InAir = false;
+				if (auto const pJJ = locomotion_cast<JumpjetLocomotionClass*>(pUnit->Locomotor))
+					pJJ->CurrentHeight = 0;
 				pBld->UpdateBunker();
+			}
 		return 0;
 	}
 
@@ -564,6 +573,16 @@ DEFINE_HOOK(0x458EAF, BuildingClass_UpdateBunker_Idle_BunkerExtProbe, 0x5)
 			pThis->BunkerLinkedItem = pUnit;
 			pUnit->BunkerLinkedItem = pThis;
 			pUnit->PrimaryFacing.SetCurrent(DirStruct(DirType::South));
+
+			// Ground the unit so it draws inside the walls, not above them. A
+			// jumpjet keeps a flight height (JumpjetLocomotionClass::CurrentHeight)
+			// that we skipped zeroing by bypassing the track states; left set it
+			// floats over the walls AND, via iso projection, looks off-centre.
+			pUnit->InAir = false;
+			pUnit->SetHeight(0);
+			if (auto const pJJ = locomotion_cast<JumpjetLocomotionClass*>(pUnit->Locomotor))
+				pJJ->CurrentHeight = 0;
+
 			pThis->TankBunkerState = ::TankBunkerState::RotateInBunker;
 			Debug::Log("[BunkerExt] f%d %s captured deployed %s -> RotateInBunker\n",
 				frame, pThis->Type->ID, BunkerProbe::IdOf(pUnit));
