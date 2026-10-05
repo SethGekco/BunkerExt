@@ -51,6 +51,9 @@
 #include <Dir.h>
 #include <JumpjetLocomotionClass.h>
 #include <LocomotionClass.h>
+#include <AnimClass.h>
+#include <AnimTypeClass.h>
+#include <Memory.h>
 
 #include <Syringe.h>
 #include <Utilities/Macro.h>
@@ -123,25 +126,25 @@ namespace BunkerProbe
 	// Entry intent: a unit ordered into a bunker (Enter cursor) and told to
 	// deploy, awaiting deploy-complete before final capture. Small fixed
 	// table; pointers are opaque keys, re-validated live each use.
-	struct Intent { UnitClass* unit; BuildingClass* bld; };
+	struct Intent { UnitClass* unit; BuildingClass* bld; int doneFrame; };
 	static constexpr size_t MaxIntents = 32;
 	static Intent intents[MaxIntents];
 	static size_t intentCount = 0;
 
-	static BuildingClass* FindIntent(UnitClass* pUnit)
+	static Intent* FindIntent(UnitClass* pUnit)
 	{
 		for (size_t i = 0; i < intentCount; ++i)
 			if (intents[i].unit == pUnit)
-				return intents[i].bld;
+				return &intents[i];
 		return nullptr;
 	}
 
-	static void AddIntent(UnitClass* pUnit, BuildingClass* pBld)
+	static void AddIntent(UnitClass* pUnit, BuildingClass* pBld, int doneFrame)
 	{
 		if (FindIntent(pUnit))
 			return;
 		if (intentCount < MaxIntents)
-			intents[intentCount++] = { pUnit, pBld };
+			intents[intentCount++] = { pUnit, pBld, doneFrame };
 	}
 
 	static void RemoveIntent(UnitClass* pUnit)
@@ -456,10 +459,28 @@ DEFINE_HOOK(0x7360C0, UnitClass_Update_BunkerExtCapture, 0x5)
 		return c;
 	};
 
-	// --- Phase B: arrival detected -> trigger a REAL deploy where the unit can
-	// actually land (on clear ground near the bunker; the engine will not let a
-	// unit deploy ON the bunker's own foundation cell), and record intent. The
-	// unit plays its deploy animation like pressing D.
+	// Pin a unit grounded at a coord (used while the manual deploy anim plays).
+	auto groundAt = [](UnitClass* pU, const CoordStruct& c) {
+		if (pU->Locomotor)
+			pU->Locomotor->Mark_All_Occupation_Bits(MarkType::Up);
+		pU->SetLocation(c);
+		if (pU->Locomotor)
+			pU->Locomotor->Mark_All_Occupation_Bits(MarkType::Down);
+		pU->InAir = false;
+		pU->SetHeight(0);
+		if (auto const pJJ = locomotion_cast<JumpjetLocomotionClass*>(pU->Locomotor))
+		{
+			pJJ->State = JumpjetLocomotionClass::State::Grounded;
+			pJJ->CurrentHeight = 0;
+			pJJ->IsMoving = false;
+		}
+	};
+
+	// --- Phase B: arrival detected -> land the unit on the pad centre and play
+	// its deploy animation THERE, manually. We can't use the vanilla deploy
+	// (the engine refuses to deploy a unit onto a building's foundation), so we
+	// ground the unit at centre, spawn its DeployingAnim, and finish after the
+	// animation's duration. No shuffle, no side-landing.
 	if (!BunkerProbe::FindIntent(pUnit) && pUnit->CurrentMission == Mission::Enter)
 	{
 		auto const pBld = abstract_cast<BuildingClass*>(pUnit->Destination);
@@ -469,46 +490,63 @@ DEFINE_HOOK(0x7360C0, UnitClass_Update_BunkerExtCapture, 0x5)
 			&& !pUnit->Deployed && !pUnit->Deploying
 			&& pUnit->DistanceFrom(pBld) <= pBld->Type->GetFoundationWidth() * 128 + 256)
 		{
+			auto const centre = bunkerCentre(pBld);
 			pUnit->SetDestination(nullptr, false);
-			pUnit->QueueMission(Mission::Unload, true); // start deploy (land + anim)
-			BunkerProbe::AddIntent(pUnit, pBld);
-			Debug::Log("[BunkerExt] f%d IntentDeploy %s -> %s (deploying)\n",
-				frame, BunkerProbe::IdOf(pUnit), pBld->Type->ID);
+			pUnit->QueueMission(Mission::Guard, false); // stop flying/retrying
+			groundAt(pUnit, centre);
+			pUnit->PrimaryFacing.SetCurrent(DirStruct(DirType::South));
+
+			int dur = 0;
+			if (auto const pAnimType = pUnit->Type->DeployingAnim)
+			{
+				GameCreate<AnimClass>(pAnimType, centre, 0, 1, 0x600, 0, false);
+				int rate = pAnimType->Rate > 0 ? pAnimType->Rate : 1;
+				dur = pAnimType->End > 0 ? pAnimType->End * rate : 30;
+				if (dur < 15) dur = 15;
+				if (dur > 120) dur = 120;
+			}
+
+			BunkerProbe::AddIntent(pUnit, pBld, frame + dur);
+			Debug::Log("[BunkerExt] f%d IntentDeploy %s -> %s (anim at centre, %d frames)\n",
+				frame, BunkerProbe::IdOf(pUnit), pBld->Type->ID, dur);
 		}
 		return 0;
 	}
 
-	// --- Phase A: our ordered unit finished deploying (landed, grounded) ->
-	// finalize: teleport onto the foundation centre, link, raise walls. Because
-	// it is genuinely deployed + on the deck, the walls draw over it correctly.
-	if (auto const pBld = BunkerProbe::FindIntent(pUnit))
+	// --- Phase A: deploy animation playing on the pad -> hold grounded at
+	// centre until the timer elapses, then finalize: mark deployed, link,
+	// raise walls (over the grounded unit).
+	if (auto const pIntent = BunkerProbe::FindIntent(pUnit))
 	{
-		// Target gone / taken / unit lost while deploying: drop the intent.
+		auto const pBld = pIntent->bld;
 		if (!pBld->Type->Bunker || pBld->BunkerLinkedItem || pBld->InLimbo
 			|| pBld->TankBunkerState != ::TankBunkerState::Idle)
 		{
 			BunkerProbe::RemoveIntent(pUnit);
 			return 0;
 		}
-		if (!pUnit->Deployed)
-			return 0; // still descending / playing the deploy animation
 
-		auto dest = bunkerCentre(pBld);
-		if (pUnit->Locomotor)
-			pUnit->Locomotor->Mark_All_Occupation_Bits(MarkType::Up);
-		pUnit->SetLocation(dest);
-		if (pUnit->Locomotor)
-			pUnit->Locomotor->Mark_All_Occupation_Bits(MarkType::Down);
+		auto const centre = bunkerCentre(pBld);
 
+		if (frame < pIntent->doneFrame)
+		{
+			groundAt(pUnit, centre); // keep it on the pad while the anim plays
+			return 0;
+		}
+
+		// Animation finished -> become the deployed (land/siege) form + capture.
+		pUnit->Deployed = true;
+		pUnit->Deploying = false;
+		groundAt(pUnit, centre);
 		auto const after = pUnit->GetCoords();
 		pUnit->SetDestination(nullptr, false);
 		pBld->BunkerLinkedItem = pUnit;
 		pUnit->BunkerLinkedItem = pBld;
 		pBld->TankBunkerState = ::TankBunkerState::Idle;
 		BunkerProbe::RemoveIntent(pUnit);
-		Debug::Log("[BunkerExt] f%d IntentCapture %s -> %s: dest=(%d,%d) after=(%d,%d)\n",
+		Debug::Log("[BunkerExt] f%d IntentCapture %s -> %s: centre=(%d,%d) after=(%d,%d)\n",
 			frame, BunkerProbe::IdOf(pUnit), pBld->Type->ID,
-			dest.X, dest.Y, after.X, after.Y);
+			centre.X, centre.Y, after.X, after.Y);
 		pBld->UpdateBunker();
 	}
 
