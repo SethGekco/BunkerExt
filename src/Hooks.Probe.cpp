@@ -385,16 +385,20 @@ DEFINE_HOOK(0x7360C0, UnitClass_Update_BunkerExtCapture, 0x5)
 	// stay out of the way once Bunkered.
 	if (pUnit->BunkerLinkedItem)
 	{
+		// Keep a bunkered jumpjet grounded EVERY frame (including after it is
+		// fully Bunkered): the loco's Process runs later in this same Update
+		// and re-raises flight height unless its State is pinned to Grounded.
+		pUnit->InAir = false;
+		if (auto const pJJ = locomotion_cast<JumpjetLocomotionClass*>(pUnit->Locomotor))
+		{
+			pJJ->State = JumpjetLocomotionClass::State::Grounded;
+			pJJ->CurrentHeight = 0;
+			pJJ->IsMoving = false;
+		}
+
 		if (auto const pBld = abstract_cast<BuildingClass*>(pUnit->BunkerLinkedItem))
 			if (pBld->TankBunkerState != ::TankBunkerState::Bunkered)
-			{
-				// Keep the unit grounded through the 4->5->6 frames — the
-				// jumpjet loco would otherwise re-raise its flight height.
-				pUnit->InAir = false;
-				if (auto const pJJ = locomotion_cast<JumpjetLocomotionClass*>(pUnit->Locomotor))
-					pJJ->CurrentHeight = 0;
 				pBld->UpdateBunker();
-			}
 		return 0;
 	}
 
@@ -435,15 +439,26 @@ DEFINE_HOOK(0x7360C0, UnitClass_Update_BunkerExtCapture, 0x5)
 		if (!sameSide || dist > maxDist)
 			continue;
 
-		// Teleport onto the pad, link both ways, drive the state machine.
+		// Teleport onto the foundation's geometric centre (GetCoords returns a
+		// building's TARGET coord, not its centre, so compute it from the cell
+		// origin + half the foundation). Keep the building's ground Z.
+		auto const tl = pBld->GetMapCoords();
+		const int fw = pBld->Type->GetFoundationWidth();
+		const int fh = pBld->Type->GetFoundationHeight(false);
 		auto dest = pBld->GetCoords();
-		dest.X += 128;
-		dest.Y += 128;
+		dest.X = tl.X * 256 + fw * 128;
+		dest.Y = tl.Y * 256 + fh * 128;
+
 		if (pUnit->Locomotor)
 			pUnit->Locomotor->Mark_All_Occupation_Bits(MarkType::Up);
 		pUnit->SetLocation(dest);
 		if (pUnit->Locomotor)
 			pUnit->Locomotor->Mark_All_Occupation_Bits(MarkType::Down);
+
+		auto const after = pUnit->GetCoords();
+		Debug::Log("[BunkerExt] f%d teleport %s: dest=(%d,%d,%d) bldCoord=(%d,%d) after=(%d,%d,%d)\n",
+			frame, BunkerProbe::IdOf(pUnit), dest.X, dest.Y, dest.Z,
+			pBld->GetCoords().X, pBld->GetCoords().Y, after.X, after.Y, after.Z);
 
 		pBld->BunkerLinkedItem = pUnit;
 		pUnit->BunkerLinkedItem = pBld;
@@ -581,7 +596,11 @@ DEFINE_HOOK(0x458EAF, BuildingClass_UpdateBunker_Idle_BunkerExtProbe, 0x5)
 			pUnit->InAir = false;
 			pUnit->SetHeight(0);
 			if (auto const pJJ = locomotion_cast<JumpjetLocomotionClass*>(pUnit->Locomotor))
+			{
+				pJJ->State = JumpjetLocomotionClass::State::Grounded;
 				pJJ->CurrentHeight = 0;
+				pJJ->IsMoving = false;
+			}
 
 			pThis->TankBunkerState = ::TankBunkerState::RotateInBunker;
 			Debug::Log("[BunkerExt] f%d %s captured deployed %s -> RotateInBunker\n",
