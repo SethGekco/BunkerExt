@@ -402,94 +402,58 @@ DEFINE_HOOK(0x7360C0, UnitClass_Update_BunkerExtCapture, 0x5)
 		return 0;
 	}
 
-	// Diagnostic: watch what a tagged unit does after an Enter click (mission,
-	// destination, movement) so the intent-capture flow can be designed. Logged
-	// per-unit on mission change, plus a ~5s heartbeat.
-	if (BunkerTags::DeployToEnter(pUnit->GetTechnoType()))
-	{
-		static UnitClass* lastU = nullptr;
-		static int lastMission = -1;
-		static int lastBeat = -100000;
-		const int f = Unsorted::CurrentFrame;
-		const int mission = static_cast<int>(pUnit->CurrentMission);
-		if (pUnit != lastU || mission != lastMission || f - lastBeat > 75)
-		{
-			lastU = pUnit; lastMission = mission; lastBeat = f;
-			auto const pDest = abstract_cast<BuildingClass*>(pUnit->Destination);
-			const bool moving = pUnit->Locomotor && pUnit->Locomotor->Is_Moving();
-			Debug::Log("[BunkerExt] f%d %s mission=%d deployed=%d moving=%d dest=%s\n",
-				f, BunkerProbe::IdOf(pUnit), mission, pUnit->Deployed, moving,
-				pDest ? pDest->Type->ID : "<none>");
-		}
-	}
+	// INTENT capture. The player orders a tagged deployer in via the Enter
+	// cursor (0x74022D), which issues Mission::Enter toward the bunker; the
+	// jumpjet flies over and hovers near the centre but can't finish the
+	// vanilla (drive-track) entry. When it arrives we deploy it into land mode
+	// and capture. A plain deploy near a bunker no longer captures — intent
+	// only — so a player meaning to deploy can't trigger it by accident.
+	if (!BunkerTags::DeployToEnter(pUnit->GetTechnoType()))
+		return 0;
+	if (pUnit->CurrentMission != Mission::Enter)
+		return 0;
 
-	// Cheapest rejects first: only tagged, deployed units proceed.
-	if (!pUnit->Deployed || !BunkerTags::DeployToEnter(pUnit->GetTechnoType()))
+	auto const pBld = abstract_cast<BuildingClass*>(pUnit->Destination);
+	if (!pBld || !pBld->Type->Bunker || pBld->BunkerLinkedItem || pBld->InLimbo
+		|| pBld->TankBunkerState != ::TankBunkerState::Idle
+		|| pUnit->Owner != pBld->Owner)
 		return 0;
 
 	const int frame = Unsorted::CurrentFrame;
-	static int lastLogFrame = -100000;
+	const int fw = pBld->Type->GetFoundationWidth();
+	const int fh = pBld->Type->GetFoundationHeight(false);
 
-	for (auto const pBld : BuildingClass::Array)
-	{
-		if (!pBld->Type->Bunker || pBld->BunkerLinkedItem || pBld->InLimbo)
-			continue;
-		if (pBld->TankBunkerState != ::TankBunkerState::Idle)
-			continue;
-
-		const int range = BunkerTags::DeployCaptureRange(pBld->Type);
-		if (range <= 0)
-			continue;
-
-		const int w = pBld->Type->GetFoundationWidth();
-		const int maxDist = w * 128 + range * 256 + 128;
-		const int dist = pUnit->DistanceFrom(pBld);
-		const bool sameSide = pUnit->Owner == pBld->Owner
-			|| (pBld->Owner && pBld->Owner->IsAlliedWith(pUnit->Owner));
-
-		if (frame - lastLogFrame >= 60)
-		{
-			lastLogFrame = frame;
-			Debug::Log(
-				"[BunkerExt] f%d UnitCapture %s near %s: dist=%d (max=%d)"
-				" sameSide=%d\n",
-				frame, BunkerProbe::IdOf(pUnit), pBld->Type->ID, dist, maxDist,
-				sameSide);
-		}
-
-		if (!sameSide || dist > maxDist)
-			continue;
-
-		// Teleport onto the foundation's geometric centre (GetCoords returns a
-		// building's TARGET coord, not its centre, so compute it from the cell
-		// origin + half the foundation). Keep the building's ground Z.
-		auto const tl = pBld->GetMapCoords();
-		const int fw = pBld->Type->GetFoundationWidth();
-		const int fh = pBld->Type->GetFoundationHeight(false);
-		auto dest = pBld->GetCoords();
-		dest.X = tl.X * 256 + fw * 128;
-		dest.Y = tl.Y * 256 + fh * 128;
-
-		if (pUnit->Locomotor)
-			pUnit->Locomotor->Mark_All_Occupation_Bits(MarkType::Up);
-		pUnit->SetLocation(dest);
-		if (pUnit->Locomotor)
-			pUnit->Locomotor->Mark_All_Occupation_Bits(MarkType::Down);
-
-		auto const after = pUnit->GetCoords();
-		Debug::Log("[BunkerExt] f%d teleport %s: dest=(%d,%d,%d) bldCoord=(%d,%d) after=(%d,%d,%d)\n",
-			frame, BunkerProbe::IdOf(pUnit), dest.X, dest.Y, dest.Z,
-			pBld->GetCoords().X, pBld->GetCoords().Y, after.X, after.Y, after.Z);
-
-		pBld->BunkerLinkedItem = pUnit;
-		pUnit->BunkerLinkedItem = pBld;
-		pBld->TankBunkerState = ::TankBunkerState::Idle;
-		Debug::Log("[BunkerExt] f%d UnitCapture %s -> %s, driving UpdateBunker\n",
-			frame, BunkerProbe::IdOf(pUnit), pBld->Type->ID);
-		pBld->UpdateBunker();
+	// Arrived? (close to the bunker). Keep flying otherwise.
+	if (pUnit->DistanceFrom(pBld) > fw * 128 + 256)
 		return 0;
-	}
 
+	// Deploy into land/siege mode so the turreted form sits in the bunker.
+	pUnit->Deployed = true;
+	pUnit->Deploying = false;
+	pUnit->SetDestination(nullptr, false);
+	pUnit->QueueMission(Mission::Guard, false); // stop the Enter oscillation
+
+	// Teleport onto the foundation's geometric centre (a building's GetCoords
+	// is its TARGET coord, not centre: compute from cell origin + half size).
+	auto const tl = pBld->GetMapCoords();
+	auto dest = pBld->GetCoords();
+	dest.X = tl.X * 256 + fw * 128;
+	dest.Y = tl.Y * 256 + fh * 128;
+
+	if (pUnit->Locomotor)
+		pUnit->Locomotor->Mark_All_Occupation_Bits(MarkType::Up);
+	pUnit->SetLocation(dest);
+	if (pUnit->Locomotor)
+		pUnit->Locomotor->Mark_All_Occupation_Bits(MarkType::Down);
+
+	auto const after = pUnit->GetCoords();
+	pBld->BunkerLinkedItem = pUnit;
+	pUnit->BunkerLinkedItem = pBld;
+	pBld->TankBunkerState = ::TankBunkerState::Idle;
+	Debug::Log("[BunkerExt] f%d IntentCapture %s -> %s: dest=(%d,%d) after=(%d,%d)\n",
+		frame, BunkerProbe::IdOf(pUnit), pBld->Type->ID,
+		dest.X, dest.Y, after.X, after.Y);
+	pBld->UpdateBunker();
 	return 0;
 }
 
