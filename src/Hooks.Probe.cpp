@@ -120,6 +120,40 @@ namespace BunkerProbe
 		return pTechno ? pTechno->GetTechnoType()->ID : "<null>";
 	}
 
+	// Entry intent: a unit ordered into a bunker (Enter cursor) and told to
+	// deploy, awaiting deploy-complete before final capture. Small fixed
+	// table; pointers are opaque keys, re-validated live each use.
+	struct Intent { UnitClass* unit; BuildingClass* bld; };
+	static constexpr size_t MaxIntents = 32;
+	static Intent intents[MaxIntents];
+	static size_t intentCount = 0;
+
+	static BuildingClass* FindIntent(UnitClass* pUnit)
+	{
+		for (size_t i = 0; i < intentCount; ++i)
+			if (intents[i].unit == pUnit)
+				return intents[i].bld;
+		return nullptr;
+	}
+
+	static void AddIntent(UnitClass* pUnit, BuildingClass* pBld)
+	{
+		if (FindIntent(pUnit))
+			return;
+		if (intentCount < MaxIntents)
+			intents[intentCount++] = { pUnit, pBld };
+	}
+
+	static void RemoveIntent(UnitClass* pUnit)
+	{
+		for (size_t i = 0; i < intentCount; ++i)
+			if (intents[i].unit == pUnit)
+			{
+				intents[i] = intents[--intentCount];
+				return;
+			}
+	}
+
 	// YRpp's GetNthLink is an unchecked Items[idx] read; the game's own
 	// 0x65AD30 bounds-checks. Guard so an empty link vector can't fault us.
 	static TechnoClass* FirstLink(RadioClass* pRadio)
@@ -402,58 +436,77 @@ DEFINE_HOOK(0x7360C0, UnitClass_Update_BunkerExtCapture, 0x5)
 		return 0;
 	}
 
-	// INTENT capture. The player orders a tagged deployer in via the Enter
-	// cursor (0x74022D), which issues Mission::Enter toward the bunker; the
-	// jumpjet flies over and hovers near the centre but can't finish the
-	// vanilla (drive-track) entry. When it arrives we deploy it into land mode
-	// and capture. A plain deploy near a bunker no longer captures — intent
-	// only — so a player meaning to deploy can't trigger it by accident.
+	// INTENT capture, two phases. The player orders a tagged deployer in via
+	// the Enter cursor (0x74022D), which issues Mission::Enter toward the
+	// bunker; the jumpjet flies over and hovers near the centre but can't
+	// finish the vanilla (drive-track) entry. A plain deploy near a bunker
+	// never captures — intent only — so it can't fire by accident.
 	if (!BunkerTags::DeployToEnter(pUnit->GetTechnoType()))
-		return 0;
-	if (pUnit->CurrentMission != Mission::Enter)
-		return 0;
-
-	auto const pBld = abstract_cast<BuildingClass*>(pUnit->Destination);
-	if (!pBld || !pBld->Type->Bunker || pBld->BunkerLinkedItem || pBld->InLimbo
-		|| pBld->TankBunkerState != ::TankBunkerState::Idle
-		|| pUnit->Owner != pBld->Owner)
 		return 0;
 
 	const int frame = Unsorted::CurrentFrame;
-	const int fw = pBld->Type->GetFoundationWidth();
-	const int fh = pBld->Type->GetFoundationHeight(false);
 
-	// Arrived? (close to the bunker). Keep flying otherwise.
-	if (pUnit->DistanceFrom(pBld) > fw * 128 + 256)
+	// --- Phase B: arrival detected -> trigger a REAL deploy (descent + anim)
+	// and record intent. We do NOT teleport/force-deploy here, so the unit
+	// actually lands and plays its deploy animation like pressing D.
+	if (!BunkerProbe::FindIntent(pUnit) && pUnit->CurrentMission == Mission::Enter)
+	{
+		auto const pBld = abstract_cast<BuildingClass*>(pUnit->Destination);
+		if (pBld && pBld->Type->Bunker && !pBld->BunkerLinkedItem && !pBld->InLimbo
+			&& pBld->TankBunkerState == ::TankBunkerState::Idle
+			&& pUnit->Owner == pBld->Owner
+			&& !pUnit->Deployed && !pUnit->Deploying
+			&& pUnit->DistanceFrom(pBld) <= pBld->Type->GetFoundationWidth() * 128 + 256)
+		{
+			pUnit->SetDestination(nullptr, false);
+			pUnit->QueueMission(Mission::Unload, true); // start deploy (land + anim)
+			BunkerProbe::AddIntent(pUnit, pBld);
+			Debug::Log("[BunkerExt] f%d IntentDeploy %s -> %s (deploying)\n",
+				frame, BunkerProbe::IdOf(pUnit), pBld->Type->ID);
+		}
 		return 0;
+	}
 
-	// Deploy into land/siege mode so the turreted form sits in the bunker.
-	pUnit->Deployed = true;
-	pUnit->Deploying = false;
-	pUnit->SetDestination(nullptr, false);
-	pUnit->QueueMission(Mission::Guard, false); // stop the Enter oscillation
+	// --- Phase A: our ordered unit finished deploying (landed, grounded) ->
+	// finalize: teleport onto the foundation centre, link, raise walls. Because
+	// it is genuinely deployed + on the deck, the walls draw over it correctly.
+	if (auto const pBld = BunkerProbe::FindIntent(pUnit))
+	{
+		// Target gone / taken / unit lost while deploying: drop the intent.
+		if (!pBld->Type->Bunker || pBld->BunkerLinkedItem || pBld->InLimbo
+			|| pBld->TankBunkerState != ::TankBunkerState::Idle)
+		{
+			BunkerProbe::RemoveIntent(pUnit);
+			return 0;
+		}
+		if (!pUnit->Deployed)
+			return 0; // still descending / playing the deploy animation
 
-	// Teleport onto the foundation's geometric centre (a building's GetCoords
-	// is its TARGET coord, not centre: compute from cell origin + half size).
-	auto const tl = pBld->GetMapCoords();
-	auto dest = pBld->GetCoords();
-	dest.X = tl.X * 256 + fw * 128;
-	dest.Y = tl.Y * 256 + fh * 128;
+		const int fw = pBld->Type->GetFoundationWidth();
+		const int fh = pBld->Type->GetFoundationHeight(false);
+		auto const tl = pBld->GetMapCoords();
+		auto dest = pBld->GetCoords();
+		dest.X = tl.X * 256 + fw * 128;
+		dest.Y = tl.Y * 256 + fh * 128;
 
-	if (pUnit->Locomotor)
-		pUnit->Locomotor->Mark_All_Occupation_Bits(MarkType::Up);
-	pUnit->SetLocation(dest);
-	if (pUnit->Locomotor)
-		pUnit->Locomotor->Mark_All_Occupation_Bits(MarkType::Down);
+		if (pUnit->Locomotor)
+			pUnit->Locomotor->Mark_All_Occupation_Bits(MarkType::Up);
+		pUnit->SetLocation(dest);
+		if (pUnit->Locomotor)
+			pUnit->Locomotor->Mark_All_Occupation_Bits(MarkType::Down);
 
-	auto const after = pUnit->GetCoords();
-	pBld->BunkerLinkedItem = pUnit;
-	pUnit->BunkerLinkedItem = pBld;
-	pBld->TankBunkerState = ::TankBunkerState::Idle;
-	Debug::Log("[BunkerExt] f%d IntentCapture %s -> %s: dest=(%d,%d) after=(%d,%d)\n",
-		frame, BunkerProbe::IdOf(pUnit), pBld->Type->ID,
-		dest.X, dest.Y, after.X, after.Y);
-	pBld->UpdateBunker();
+		auto const after = pUnit->GetCoords();
+		pUnit->SetDestination(nullptr, false);
+		pBld->BunkerLinkedItem = pUnit;
+		pUnit->BunkerLinkedItem = pBld;
+		pBld->TankBunkerState = ::TankBunkerState::Idle;
+		BunkerProbe::RemoveIntent(pUnit);
+		Debug::Log("[BunkerExt] f%d IntentCapture %s -> %s: dest=(%d,%d) after=(%d,%d)\n",
+			frame, BunkerProbe::IdOf(pUnit), pBld->Type->ID,
+			dest.X, dest.Y, after.X, after.Y);
+		pBld->UpdateBunker();
+	}
+
 	return 0;
 }
 
