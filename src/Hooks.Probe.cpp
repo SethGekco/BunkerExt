@@ -446,9 +446,20 @@ DEFINE_HOOK(0x7360C0, UnitClass_Update_BunkerExtCapture, 0x5)
 
 	const int frame = Unsorted::CurrentFrame;
 
-	// --- Phase B: arrival detected -> trigger a REAL deploy (descent + anim)
-	// and record intent. We do NOT teleport/force-deploy here, so the unit
-	// actually lands and plays its deploy animation like pressing D.
+	// Foundation geometric centre (a building's GetCoords is its TARGET coord,
+	// not its centre: compute from cell origin + half the foundation).
+	auto bunkerCentre = [](BuildingClass* pB) {
+		auto const tl = pB->GetMapCoords();
+		auto c = pB->GetCoords();
+		c.X = tl.X * 256 + pB->Type->GetFoundationWidth() * 128;
+		c.Y = tl.Y * 256 + pB->Type->GetFoundationHeight(false) * 128;
+		return c;
+	};
+
+	// --- Phase B: arrival detected -> move the unit onto the pad centre and
+	// trigger a REAL deploy (descent + anim), then record intent. Teleporting
+	// to centre first means the descend/land/deploy-animation all play on the
+	// pad instead of the unit shuffling to a clear cell beside the bunker.
 	if (!BunkerProbe::FindIntent(pUnit) && pUnit->CurrentMission == Mission::Enter)
 	{
 		auto const pBld = abstract_cast<BuildingClass*>(pUnit->Destination);
@@ -458,18 +469,23 @@ DEFINE_HOOK(0x7360C0, UnitClass_Update_BunkerExtCapture, 0x5)
 			&& !pUnit->Deployed && !pUnit->Deploying
 			&& pUnit->DistanceFrom(pBld) <= pBld->Type->GetFoundationWidth() * 128 + 256)
 		{
+			auto const centre = bunkerCentre(pBld);
+			if (pUnit->Locomotor)
+				pUnit->Locomotor->Mark_All_Occupation_Bits(MarkType::Up);
+			pUnit->SetLocation(centre);
+			if (pUnit->Locomotor)
+				pUnit->Locomotor->Mark_All_Occupation_Bits(MarkType::Down);
+
 			pUnit->SetDestination(nullptr, false);
 			pUnit->QueueMission(Mission::Unload, true); // start deploy (land + anim)
 			BunkerProbe::AddIntent(pUnit, pBld);
-			Debug::Log("[BunkerExt] f%d IntentDeploy %s -> %s (deploying)\n",
+			Debug::Log("[BunkerExt] f%d IntentDeploy %s -> %s (deploying at centre)\n",
 				frame, BunkerProbe::IdOf(pUnit), pBld->Type->ID);
 		}
 		return 0;
 	}
 
-	// --- Phase A: our ordered unit finished deploying (landed, grounded) ->
-	// finalize: teleport onto the foundation centre, link, raise walls. Because
-	// it is genuinely deployed + on the deck, the walls draw over it correctly.
+	// --- Phase A: our ordered unit is deploying on the pad.
 	if (auto const pBld = BunkerProbe::FindIntent(pUnit))
 	{
 		// Target gone / taken / unit lost while deploying: drop the intent.
@@ -479,16 +495,27 @@ DEFINE_HOOK(0x7360C0, UnitClass_Update_BunkerExtCapture, 0x5)
 			BunkerProbe::RemoveIntent(pUnit);
 			return 0;
 		}
+
+		auto const centre = bunkerCentre(pBld);
+
+		// Still descending / playing the deploy animation: pin X/Y to the pad
+		// centre each frame (preserve Z so the descent animates) so the deploy
+		// can't shuffle the unit off the bunker.
 		if (!pUnit->Deployed)
-			return 0; // still descending / playing the deploy animation
+		{
+			auto pinned = centre;
+			pinned.Z = pUnit->GetCoords().Z;
+			if (pUnit->Locomotor)
+				pUnit->Locomotor->Mark_All_Occupation_Bits(MarkType::Up);
+			pUnit->SetLocation(pinned);
+			if (pUnit->Locomotor)
+				pUnit->Locomotor->Mark_All_Occupation_Bits(MarkType::Down);
+			return 0;
+		}
 
-		const int fw = pBld->Type->GetFoundationWidth();
-		const int fh = pBld->Type->GetFoundationHeight(false);
-		auto const tl = pBld->GetMapCoords();
-		auto dest = pBld->GetCoords();
-		dest.X = tl.X * 256 + fw * 128;
-		dest.Y = tl.Y * 256 + fh * 128;
-
+		// Deployed + grounded on the pad -> finalize: snap to exact centre,
+		// link, raise walls (walls draw over the genuinely grounded unit).
+		auto dest = centre;
 		if (pUnit->Locomotor)
 			pUnit->Locomotor->Mark_All_Occupation_Bits(MarkType::Up);
 		pUnit->SetLocation(dest);
