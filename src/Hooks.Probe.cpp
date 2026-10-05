@@ -476,11 +476,10 @@ DEFINE_HOOK(0x7360C0, UnitClass_Update_BunkerExtCapture, 0x5)
 		}
 	};
 
-	// --- Phase B: arrival detected -> land the unit on the pad centre and play
-	// its deploy animation THERE, manually. We can't use the vanilla deploy
-	// (the engine refuses to deploy a unit onto a building's foundation), so we
-	// ground the unit at centre, spawn its DeployingAnim, and finish after the
-	// animation's duration. No shuffle, no side-landing.
+	// --- Phase B: arrival detected -> trigger the REAL vanilla deploy. The
+	// engine will not deploy a unit onto a building's own foundation, so the
+	// chopper lands just beside the bunker, but the engine renders it correctly
+	// (house palette, facing, descent, deploy animation). Record intent.
 	if (!BunkerProbe::FindIntent(pUnit) && pUnit->CurrentMission == Mission::Enter)
 	{
 		auto const pBld = abstract_cast<BuildingClass*>(pUnit->Destination);
@@ -490,38 +489,18 @@ DEFINE_HOOK(0x7360C0, UnitClass_Update_BunkerExtCapture, 0x5)
 			&& !pUnit->Deployed && !pUnit->Deploying
 			&& pUnit->DistanceFrom(pBld) <= pBld->Type->GetFoundationWidth() * 128 + 256)
 		{
-			auto const centre = bunkerCentre(pBld);
 			pUnit->SetDestination(nullptr, false);
-			pUnit->QueueMission(Mission::Guard, false); // stop flying/retrying
-			groundAt(pUnit, centre);
-			pUnit->PrimaryFacing.SetCurrent(DirStruct(DirType::South));
-
-			int dur = 0;
-			if (auto const pAnimType = pUnit->Type->DeployingAnim)
-			{
-				auto const pAnim = GameCreate<AnimClass>(pAnimType, centre, 0, 1, 0x600, 0, false);
-				pAnim->SetOwnerObject(pUnit);
-				// Register the anim as the unit's DeployAnim and flag Deploying:
-				// the engine's unit draw then shows the animation and hides the
-				// voxel (otherwise the chopper draws on top of the anim).
-				pUnit->DeployAnim = pAnim;
-				pUnit->Deploying = true;
-				int rate = pAnimType->Rate > 0 ? pAnimType->Rate : 1;
-				dur = pAnimType->End > 0 ? pAnimType->End * rate : 30;
-				if (dur < 15) dur = 15;
-				if (dur > 120) dur = 120;
-			}
-
-			BunkerProbe::AddIntent(pUnit, pBld, frame + dur);
-			Debug::Log("[BunkerExt] f%d IntentDeploy %s -> %s (anim at centre, %d frames)\n",
-				frame, BunkerProbe::IdOf(pUnit), pBld->Type->ID, dur);
+			pUnit->QueueMission(Mission::Unload, true); // real deploy near bunker
+			BunkerProbe::AddIntent(pUnit, pBld, 0);
+			Debug::Log("[BunkerExt] f%d IntentDeploy %s -> %s (deploying)\n",
+				frame, BunkerProbe::IdOf(pUnit), pBld->Type->ID);
 		}
 		return 0;
 	}
 
-	// --- Phase A: deploy animation playing on the pad -> hold grounded at
-	// centre until the timer elapses, then finalize: mark deployed, link,
-	// raise walls (over the grounded unit).
+	// --- Phase A: the real deploy finished (unit landed + deployed near the
+	// bunker) -> settle it onto the pad centre, link, raise walls (over the
+	// genuinely grounded + deployed unit, so draw order is correct).
 	if (auto const pIntent = BunkerProbe::FindIntent(pUnit))
 	{
 		auto const pBld = pIntent->bld;
@@ -531,19 +510,10 @@ DEFINE_HOOK(0x7360C0, UnitClass_Update_BunkerExtCapture, 0x5)
 			BunkerProbe::RemoveIntent(pUnit);
 			return 0;
 		}
+		if (!pUnit->Deployed)
+			return 0; // still descending / playing the vanilla deploy animation
 
 		auto const centre = bunkerCentre(pBld);
-
-		if (frame < pIntent->doneFrame)
-		{
-			groundAt(pUnit, centre); // keep it on the pad while the anim plays
-			return 0;
-		}
-
-		// Animation finished -> become the deployed (land/siege) form + capture.
-		pUnit->Deployed = true;
-		pUnit->Deploying = false;
-		pUnit->DeployAnim = nullptr; // release; the anim expires on its own
 		groundAt(pUnit, centre);
 		auto const after = pUnit->GetCoords();
 		pUnit->SetDestination(nullptr, false);
