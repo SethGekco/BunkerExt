@@ -402,6 +402,27 @@ DEFINE_HOOK(0x7360C0, UnitClass_Update_BunkerExtCapture, 0x5)
 		return 0;
 	}
 
+	// Diagnostic: watch what a tagged unit does after an Enter click (mission,
+	// destination, movement) so the intent-capture flow can be designed. Logged
+	// per-unit on mission change, plus a ~5s heartbeat.
+	if (BunkerTags::DeployToEnter(pUnit->GetTechnoType()))
+	{
+		static UnitClass* lastU = nullptr;
+		static int lastMission = -1;
+		static int lastBeat = -100000;
+		const int f = Unsorted::CurrentFrame;
+		const int mission = static_cast<int>(pUnit->CurrentMission);
+		if (pUnit != lastU || mission != lastMission || f - lastBeat > 75)
+		{
+			lastU = pUnit; lastMission = mission; lastBeat = f;
+			auto const pDest = abstract_cast<BuildingClass*>(pUnit->Destination);
+			const bool moving = pUnit->Locomotor && pUnit->Locomotor->Is_Moving();
+			Debug::Log("[BunkerExt] f%d %s mission=%d deployed=%d moving=%d dest=%s\n",
+				f, BunkerProbe::IdOf(pUnit), mission, pUnit->Deployed, moving,
+				pDest ? pDest->Type->ID : "<none>");
+		}
+	}
+
 	// Cheapest rejects first: only tagged, deployed units proceed.
 	if (!pUnit->Deployed || !BunkerTags::DeployToEnter(pUnit->GetTechnoType()))
 		return 0;
@@ -502,7 +523,8 @@ DEFINE_HOOK(0x74018D, UnitClass_GetActionOnObject_BunkerExtFlyVeto, 0x6)
 // Stolen bytes are cmp+jne (5) — relative branch, so NEVER return 0.
 DEFINE_HOOK(0x74022D, UnitClass_GetActionOnObject_BunkerExtEnterUX, 0x5)
 {
-	enum { SelectBranch = 0x740232, NotSelect = 0x74027C, Done = 0x74029F };
+	enum { SelectBranch = 0x740232, NotSelect = 0x74027C,
+	       FinalizeAction = 0x74037A }; // common tail; EBX=action -> cursor+return
 
 	GET(TechnoClass*, pThis, ESI);
 	GET(ObjectClass*, pTarget, EDI);
@@ -512,19 +534,26 @@ DEFINE_HOOK(0x74022D, UnitClass_GetActionOnObject_BunkerExtEnterUX, 0x5)
 	{
 		auto const pBld = static_cast<BuildingClass*>(pTarget);
 
-		static TechnoClass* lastPair = nullptr;
-		const int frame = Unsorted::CurrentFrame;
-		if (pThis != lastPair && pBld->Type->Bunker)
+		// Grant the real Enter cursor for a tagged deployer over its own
+		// empty bunker. The jumpjet MovementZone=Fly vetoes (three of them in
+		// this function) deny Enter(3) naturally; force it and route to the
+		// action-finalize tail, which turns EBX into the Enter cursor and
+		// returns it (click then issues Mission::Enter toward the bunker).
+		if (pBld->Type->Bunker && !pBld->BunkerLinkedItem
+			&& pThis->Owner == pBld->Owner
+			&& BunkerTags::DeployToEnter(pThis->GetTechnoType()))
 		{
-			lastPair = pThis;
-			Debug::Log("[BunkerExt] f%d ActionOnObject(%s over %s): baseAction=%d\n",
-				frame, BunkerProbe::IdOf(pThis), pBld->Type->ID, action);
+			static TechnoClass* lastPair = nullptr;
+			if (pThis != lastPair)
+			{
+				lastPair = pThis;
+				Debug::Log("[BunkerExt] f%d EnterUX(%s over %s): force Enter (was %d)\n",
+					Unsorted::CurrentFrame, BunkerProbe::IdOf(pThis),
+					pBld->Type->ID, action);
+			}
+			R->EBX(3); // Action::Enter
+			return FinalizeAction;
 		}
-
-		// Telemetry only. The Move-force that lived here (phase 1c) clobbered
-		// the real fix: with the Fly-veto lifted at 0x74018D the action
-		// arriving here is already Enter(3) — pass it through untouched.
-		(void)pBld;
 	}
 
 	return action == 7 ? SelectBranch : NotSelect;
