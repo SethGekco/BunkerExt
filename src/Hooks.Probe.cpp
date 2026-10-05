@@ -499,7 +499,13 @@ DEFINE_HOOK(0x7360C0, UnitClass_Update_BunkerExtCapture, 0x5)
 			int dur = 0;
 			if (auto const pAnimType = pUnit->Type->DeployingAnim)
 			{
-				GameCreate<AnimClass>(pAnimType, centre, 0, 1, 0x600, 0, false);
+				auto const pAnim = GameCreate<AnimClass>(pAnimType, centre, 0, 1, 0x600, 0, false);
+				pAnim->SetOwnerObject(pUnit);
+				// Register the anim as the unit's DeployAnim and flag Deploying:
+				// the engine's unit draw then shows the animation and hides the
+				// voxel (otherwise the chopper draws on top of the anim).
+				pUnit->DeployAnim = pAnim;
+				pUnit->Deploying = true;
 				int rate = pAnimType->Rate > 0 ? pAnimType->Rate : 1;
 				dur = pAnimType->End > 0 ? pAnimType->End * rate : 30;
 				if (dur < 15) dur = 15;
@@ -537,6 +543,7 @@ DEFINE_HOOK(0x7360C0, UnitClass_Update_BunkerExtCapture, 0x5)
 		// Animation finished -> become the deployed (land/siege) form + capture.
 		pUnit->Deployed = true;
 		pUnit->Deploying = false;
+		pUnit->DeployAnim = nullptr; // release; the anim expires on its own
 		groundAt(pUnit, centre);
 		auto const after = pUnit->GetCoords();
 		pUnit->SetDestination(nullptr, false);
