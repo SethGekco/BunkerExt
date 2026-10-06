@@ -513,7 +513,12 @@ DEFINE_HOOK(0x7360C0, UnitClass_Update_BunkerExtCapture, 0x5)
 			int dur = 30;
 			if (auto const pAnimType = pUnit->Type->DeployingAnim)
 			{
-				GameCreate<AnimClass>(pAnimType, centre, 0, 1, 0x600, 0, false);
+				auto const pAnim = GameCreate<AnimClass>(pAnimType, centre, 0, 1, 0x600, 0, false);
+				// Give the anim the unit's house so it draws with the house
+				// remap palette (AnimClass::Owner = "used for remap"). Without
+				// this the deploy animation renders magenta/pink.
+				pAnim->SetOwnerObject(pUnit);
+				pAnim->Owner = pUnit->Owner;
 				const int rate = pAnimType->Rate > 0 ? pAnimType->Rate : 1;
 				dur = pAnimType->End > 0 ? pAnimType->End * rate : 30;
 				if (dur < 15) dur = 15;
