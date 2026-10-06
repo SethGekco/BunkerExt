@@ -476,37 +476,10 @@ DEFINE_HOOK(0x7360C0, UnitClass_Update_BunkerExtCapture, 0x5)
 		}
 	};
 
-	auto buildingAlive = [](BuildingClass* pB) {
-		for (auto const b : BuildingClass::Array)
-			if (b == pB)
-				return true;
-		return false;
-	};
-
-	// Safety sweep (once per frame): if a deploy never completes — the chopper
-	// was killed mid-deploy, say — restore the bunker's cells so it can't stay
-	// un-occupied forever. doneFrame is the deadline we set in Phase B.
-	static int lastSweep = -1;
-	if (frame != lastSweep)
-	{
-		lastSweep = frame;
-		for (int i = static_cast<int>(BunkerProbe::intentCount) - 1; i >= 0; --i)
-		{
-			auto& it = BunkerProbe::intents[i];
-			if (frame > it.doneFrame)
-			{
-				if (buildingAlive(it.bld))
-					it.bld->Mark(MarkType::Down); // re-occupy the cells
-				it = BunkerProbe::intents[--BunkerProbe::intentCount];
-			}
-		}
-	}
-
-	// --- Phase B: arrival -> temporarily free the bunker's foundation cells so
-	// the REAL vanilla deploy can land ON the pad centre (the engine refuses to
-	// deploy onto an occupied building cell). The engine renders the deploy
-	// correctly (house palette, facing, descent, animation). Teleport to centre
-	// first, Mark the building Up, then start the deploy.
+	// --- Phase B: arrival detected -> trigger the REAL vanilla deploy. The
+	// engine will not deploy a unit onto a building's own foundation, so the
+	// chopper lands just beside the bunker, but the engine renders it correctly
+	// (house palette, facing, descent, deploy animation). Record intent.
 	if (!BunkerProbe::FindIntent(pUnit) && pUnit->CurrentMission == Mission::Enter)
 	{
 		auto const pBld = abstract_cast<BuildingClass*>(pUnit->Destination);
@@ -516,39 +489,30 @@ DEFINE_HOOK(0x7360C0, UnitClass_Update_BunkerExtCapture, 0x5)
 			&& !pUnit->Deployed && !pUnit->Deploying
 			&& pUnit->DistanceFrom(pBld) <= pBld->Type->GetFoundationWidth() * 128 + 256)
 		{
-			auto const centre = bunkerCentre(pBld);
-			if (pUnit->Locomotor)
-				pUnit->Locomotor->Mark_All_Occupation_Bits(MarkType::Up);
-			pUnit->SetLocation(centre);
-			if (pUnit->Locomotor)
-				pUnit->Locomotor->Mark_All_Occupation_Bits(MarkType::Down);
-
-			pBld->Mark(MarkType::Up); // free the foundation cells for the deploy
 			pUnit->SetDestination(nullptr, false);
-			pUnit->QueueMission(Mission::Unload, true); // real deploy at centre
-			BunkerProbe::AddIntent(pUnit, pBld, frame + 300); // safety deadline
-			Debug::Log("[BunkerExt] f%d IntentDeploy %s -> %s (deploying at centre)\n",
+			pUnit->QueueMission(Mission::Unload, true); // real deploy near bunker
+			BunkerProbe::AddIntent(pUnit, pBld, 0);
+			Debug::Log("[BunkerExt] f%d IntentDeploy %s -> %s (deploying)\n",
 				frame, BunkerProbe::IdOf(pUnit), pBld->Type->ID);
 		}
 		return 0;
 	}
 
-	// --- Phase A: the real deploy finished ON the pad -> re-occupy the bunker
-	// cells, link, raise walls over the genuinely grounded + deployed unit.
+	// --- Phase A: the real deploy finished (unit landed + deployed near the
+	// bunker) -> settle it onto the pad centre, link, raise walls (over the
+	// genuinely grounded + deployed unit, so draw order is correct).
 	if (auto const pIntent = BunkerProbe::FindIntent(pUnit))
 	{
 		auto const pBld = pIntent->bld;
 		if (!pBld->Type->Bunker || pBld->BunkerLinkedItem || pBld->InLimbo
 			|| pBld->TankBunkerState != ::TankBunkerState::Idle)
 		{
-			pBld->Mark(MarkType::Down); // restore cells before abandoning
 			BunkerProbe::RemoveIntent(pUnit);
 			return 0;
 		}
 		if (!pUnit->Deployed)
 			return 0; // still descending / playing the vanilla deploy animation
 
-		pBld->Mark(MarkType::Down); // re-occupy the foundation
 		auto const centre = bunkerCentre(pBld);
 		groundAt(pUnit, centre);
 		auto const after = pUnit->GetCoords();
