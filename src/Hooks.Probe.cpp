@@ -126,7 +126,7 @@ namespace BunkerProbe
 	// Entry intent: a unit ordered into a bunker (Enter cursor) and told to
 	// deploy, awaiting deploy-complete before final capture. Small fixed
 	// table; pointers are opaque keys, re-validated live each use.
-	struct Intent { UnitClass* unit; BuildingClass* bld; int doneFrame; };
+	struct Intent { UnitClass* unit; BuildingClass* bld; int doneFrame; bool hidden; };
 	static constexpr size_t MaxIntents = 32;
 	static Intent intents[MaxIntents];
 	static size_t intentCount = 0;
@@ -144,7 +144,15 @@ namespace BunkerProbe
 		if (FindIntent(pUnit))
 			return;
 		if (intentCount < MaxIntents)
-			intents[intentCount++] = { pUnit, pBld, doneFrame };
+			intents[intentCount++] = { pUnit, pBld, doneFrame, true };
+	}
+
+	// True while a unit's deploy animation is playing on the pad — the draw
+	// hook uses this to skip rendering the voxel so the animation shows alone.
+	static bool IsHidden(UnitClass* pUnit)
+	{
+		auto const pI = FindIntent(pUnit);
+		return pI && pI->hidden;
 	}
 
 	static void RemoveIntent(UnitClass* pUnit)
@@ -476,10 +484,17 @@ DEFINE_HOOK(0x7360C0, UnitClass_Update_BunkerExtCapture, 0x5)
 		}
 	};
 
-	// --- Phase B: arrival detected -> trigger the REAL vanilla deploy. The
-	// engine will not deploy a unit onto a building's own foundation, so the
-	// chopper lands just beside the bunker, but the engine renders it correctly
-	// (house palette, facing, descent, deploy animation). Record intent.
+	auto faceSouth = [](UnitClass* pU) {
+		pU->PrimaryFacing.SetCurrent(DirStruct(DirType::South));
+		pU->SecondaryFacing.SetCurrent(DirStruct(DirType::South)); // turret
+	};
+
+	// --- Phase B: arrival detected -> land the unit on the pad centre and play
+	// its deploy animation THERE, manually. The engine refuses to deploy a unit
+	// onto a building's own foundation (it shuffles off / flies back up), so we
+	// ground the unit dead-centre, hide its voxel (draw hook, via IsHidden),
+	// spawn its DeployingAnim so the animation plays alone on the pad, and
+	// finalize after the animation's own duration. No shuffle, no side-landing.
 	if (!BunkerProbe::FindIntent(pUnit) && pUnit->CurrentMission == Mission::Enter)
 	{
 		auto const pBld = abstract_cast<BuildingClass*>(pUnit->Destination);
@@ -489,18 +504,32 @@ DEFINE_HOOK(0x7360C0, UnitClass_Update_BunkerExtCapture, 0x5)
 			&& !pUnit->Deployed && !pUnit->Deploying
 			&& pUnit->DistanceFrom(pBld) <= pBld->Type->GetFoundationWidth() * 128 + 256)
 		{
+			auto const centre = bunkerCentre(pBld);
 			pUnit->SetDestination(nullptr, false);
-			pUnit->QueueMission(Mission::Unload, true); // real deploy near bunker
-			BunkerProbe::AddIntent(pUnit, pBld, 0);
-			Debug::Log("[BunkerExt] f%d IntentDeploy %s -> %s (deploying)\n",
-				frame, BunkerProbe::IdOf(pUnit), pBld->Type->ID);
+			pUnit->QueueMission(Mission::Guard, false); // stop the enter/fly retry
+			groundAt(pUnit, centre);
+			faceSouth(pUnit);
+
+			int dur = 30;
+			if (auto const pAnimType = pUnit->Type->DeployingAnim)
+			{
+				GameCreate<AnimClass>(pAnimType, centre, 0, 1, 0x600, 0, false);
+				const int rate = pAnimType->Rate > 0 ? pAnimType->Rate : 1;
+				dur = pAnimType->End > 0 ? pAnimType->End * rate : 30;
+				if (dur < 15) dur = 15;
+				if (dur > 120) dur = 120;
+			}
+
+			BunkerProbe::AddIntent(pUnit, pBld, frame + dur); // hidden = true
+			Debug::Log("[BunkerExt] f%d IntentAnim %s -> %s (centred, %d frames, voxel hidden)\n",
+				frame, BunkerProbe::IdOf(pUnit), pBld->Type->ID, dur);
 		}
 		return 0;
 	}
 
-	// --- Phase A: the real deploy finished (unit landed + deployed near the
-	// bunker) -> settle it onto the pad centre, link, raise walls (over the
-	// genuinely grounded + deployed unit, so draw order is correct).
+	// --- Phase A: deploy animation playing on the pad -> hold the (hidden)
+	// unit grounded at centre until the timer elapses, then reveal it as the
+	// deployed form facing South and finalize (link, raise walls over it).
 	if (auto const pIntent = BunkerProbe::FindIntent(pUnit))
 	{
 		auto const pBld = pIntent->bld;
@@ -510,24 +539,46 @@ DEFINE_HOOK(0x7360C0, UnitClass_Update_BunkerExtCapture, 0x5)
 			BunkerProbe::RemoveIntent(pUnit);
 			return 0;
 		}
-		if (!pUnit->Deployed)
-			return 0; // still descending / playing the vanilla deploy animation
 
 		auto const centre = bunkerCentre(pBld);
+
+		if (frame < pIntent->doneFrame)
+		{
+			groundAt(pUnit, centre); // keep it pinned, voxel stays hidden
+			faceSouth(pUnit);
+			return 0;
+		}
+
+		// Animation finished -> reveal the deployed/siege form, facing South.
+		pIntent->hidden = false;
+		pUnit->Deployed = true;
+		pUnit->Deploying = false;
 		groundAt(pUnit, centre);
-		auto const after = pUnit->GetCoords();
-		pUnit->SetDestination(nullptr, false);
+		faceSouth(pUnit);
 		pBld->BunkerLinkedItem = pUnit;
 		pUnit->BunkerLinkedItem = pBld;
 		pBld->TankBunkerState = ::TankBunkerState::Idle;
 		BunkerProbe::RemoveIntent(pUnit);
-		Debug::Log("[BunkerExt] f%d IntentCapture %s -> %s: centre=(%d,%d) after=(%d,%d)\n",
-			frame, BunkerProbe::IdOf(pUnit), pBld->Type->ID,
-			centre.X, centre.Y, after.X, after.Y);
+		Debug::Log("[BunkerExt] f%d IntentReveal %s -> %s, raising walls\n",
+			frame, BunkerProbe::IdOf(pUnit), pBld->Type->ID);
 		pBld->UpdateBunker();
 	}
 
 	return 0;
+}
+
+// --- Hide the voxel while the deploy animation plays on the pad. -----------
+// 0x73CF62 is UnitClass::DrawIt's "draw this unit" path (the Continue target of
+// Phobos' KeepUnitVisible hook at 0x73CF46; ESI=unit, frame set up). For a unit
+// whose deploy anim is mid-play we jump to DoNotDraw (0x73D43F, the function's
+// clean epilogue) so only the animation shows — no voxel on top. Chained after
+// Kratos(0x73CF16)/Phobos(0x73CF46); those decide to draw, we veto for our
+// hidden units. Stolen bytes (6): 8b 0d 24 73 88 00 (mov ecx,[0x887324]).
+DEFINE_HOOK(0x73CF62, UnitClass_DrawIt_BunkerExtHideVoxel, 0x6)
+{
+	enum { DoNotDraw = 0x73D43F };
+	GET(UnitClass*, pThis, ESI);
+	return BunkerProbe::IsHidden(pThis) ? DoNotDraw : 0;
 }
 
 // --- Phase 1d: lift the MovementZone=Fly veto on building-enter actions. ----
