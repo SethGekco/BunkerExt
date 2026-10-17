@@ -60,6 +60,7 @@
 #include <Utilities/Debug.h>
 
 #include <BunkerTags.h>
+#include <cmath>
 
 namespace BunkerProbe
 {
@@ -505,10 +506,18 @@ DEFINE_HOOK(0x7360C0, UnitClass_Update_BunkerExtCapture, 0x5)
 			&& pUnit->DistanceFrom(pBld) <= pBld->Type->GetFoundationWidth() * 128 + 256)
 		{
 			auto const centre = bunkerCentre(pBld);
+			auto const before = pUnit->GetCoords();
+			const int snap = static_cast<int>(
+				std::sqrt(double(before.X - centre.X) * (before.X - centre.X)
+					+ double(before.Y - centre.Y) * (before.Y - centre.Y)
+					+ double(before.Z - centre.Z) * (before.Z - centre.Z)));
 			pUnit->SetDestination(nullptr, false);
 			pUnit->QueueMission(Mission::Guard, false); // stop the enter/fly retry
 			groundAt(pUnit, centre);
 			faceSouth(pUnit);
+			Debug::Log("[BunkerExt] f%d LungeMeasure %s: before=(%d,%d,%d) centre=(%d,%d,%d) snap=%d leptons\n",
+				frame, BunkerProbe::IdOf(pUnit), before.X, before.Y, before.Z,
+				centre.X, centre.Y, centre.Z, snap);
 
 			int dur = 30;
 			if (auto const pAnimType = pUnit->Type->DeployingAnim)
@@ -583,7 +592,20 @@ DEFINE_HOOK(0x73CF62, UnitClass_DrawIt_BunkerExtHideVoxel, 0x6)
 {
 	enum { DoNotDraw = 0x73D43F };
 	GET(UnitClass*, pThis, ESI);
-	return BunkerProbe::IsHidden(pThis) ? DoNotDraw : 0;
+	if (BunkerProbe::IsHidden(pThis))
+	{
+		// DIAG: prove the voxel draw is actually being skipped (throttled).
+		static int lastLog = -100000;
+		const int f = Unsorted::CurrentFrame;
+		if (f - lastLog > 30)
+		{
+			lastLog = f;
+			Debug::Log("[BunkerExt] f%d DrawSkip %s (voxel hidden this frame)\n",
+				f, BunkerProbe::IdOf(pThis));
+		}
+		return DoNotDraw;
+	}
+	return 0;
 }
 
 // --- Phase 1d: lift the MovementZone=Fly veto on building-enter actions. ----
