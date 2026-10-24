@@ -547,7 +547,14 @@ DEFINE_HOOK(0x7360C0, UnitClass_Update_BunkerExtCapture, 0x5)
 	if (auto const pIntent = BunkerProbe::FindIntent(pUnit))
 	{
 		auto const pBld = pIntent->bld;
-		if (!pBld->Type->Bunker || pBld->BunkerLinkedItem || pBld->InLimbo
+		// LIVENESS GUARD: a sold/destroyed bunker is FREED, so pBld would be a
+		// dangling pointer — dereferencing its Type/fields crashed on sell
+		// (C0000005 in the intent path). Confirm it is still a live building
+		// before touching it; if gone, drop the intent.
+		bool alive = false;
+		for (auto const b : BuildingClass::Array)
+			if (b == pBld) { alive = true; break; }
+		if (!alive || !pBld->Type->Bunker || pBld->BunkerLinkedItem || pBld->InLimbo
 			|| pBld->TankBunkerState != ::TankBunkerState::Idle)
 		{
 			BunkerProbe::RemoveIntent(pUnit);
