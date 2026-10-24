@@ -145,7 +145,7 @@ namespace BunkerProbe
 		if (FindIntent(pUnit))
 			return;
 		if (intentCount < MaxIntents)
-			intents[intentCount++] = { pUnit, pBld, doneFrame, false };
+			intents[intentCount++] = { pUnit, pBld, doneFrame, true };
 	}
 
 	// True while a unit's deploy animation is playing on the pad — the draw
@@ -490,12 +490,12 @@ DEFINE_HOOK(0x7360C0, UnitClass_Update_BunkerExtCapture, 0x5)
 		pU->SecondaryFacing.SetCurrent(DirStruct(DirType::South)); // turret
 	};
 
-	// --- Phase B: arrival detected -> trigger a REAL deploy (QueueMission
-	// Unload). The engine flies the jumpjet in and descends it (DeployToLand)
-	// with fully correct rendering — house palette, deploy facing, descent.
-	// We do NOT teleport or ground it here; the only thing the engine gets
-	// wrong is that it ABORTS the deploy on a building cell (CheckRestrictions
-	// fails) and flies back up. Phase A force-completes it at the bottom.
+	// --- Phase B: arrival detected -> land the unit on the pad centre and play
+	// its deploy animation THERE, manually. The engine refuses to deploy a unit
+	// onto a building's own foundation (it shuffles off / flies back up), so we
+	// ground the unit dead-centre, hide its voxel (draw hook, via IsHidden),
+	// spawn its DeployingAnim so the animation plays alone on the pad, and
+	// finalize after the animation's own duration. No shuffle, no side-landing.
 	if (!BunkerProbe::FindIntent(pUnit) && pUnit->CurrentMission == Mission::Enter)
 	{
 		auto const pBld = abstract_cast<BuildingClass*>(pUnit->Destination);
@@ -505,21 +505,45 @@ DEFINE_HOOK(0x7360C0, UnitClass_Update_BunkerExtCapture, 0x5)
 			&& !pUnit->Deployed && !pUnit->Deploying
 			&& pUnit->DistanceFrom(pBld) <= pBld->Type->GetFoundationWidth() * 128 + 256)
 		{
+			auto const centre = bunkerCentre(pBld);
+			auto const before = pUnit->GetCoords();
+			const int snap = static_cast<int>(
+				std::sqrt(double(before.X - centre.X) * (before.X - centre.X)
+					+ double(before.Y - centre.Y) * (before.Y - centre.Y)
+					+ double(before.Z - centre.Z) * (before.Z - centre.Z)));
 			pUnit->SetDestination(nullptr, false);
-			pUnit->QueueMission(Mission::Unload, true); // real deploy: descend + land
-			BunkerProbe::AddIntent(pUnit, pBld, 0);
-			Debug::Log("[BunkerExt] f%d IntentDeploy %s -> %s (real descent)\n",
-				frame, BunkerProbe::IdOf(pUnit), pBld->Type->ID);
+			pUnit->QueueMission(Mission::Guard, false); // stop the enter/fly retry
+			groundAt(pUnit, centre);
+			faceSouth(pUnit);
+			Debug::Log("[BunkerExt] f%d LungeMeasure %s: before=(%d,%d,%d) centre=(%d,%d,%d) snap=%d leptons\n",
+				frame, BunkerProbe::IdOf(pUnit), before.X, before.Y, before.Z,
+				centre.X, centre.Y, centre.Z, snap);
+
+			int dur = 30;
+			if (auto const pAnimType = pUnit->Type->DeployingAnim)
+			{
+				auto const pAnim = GameCreate<AnimClass>(pAnimType, centre, 0, 1, 0x600, 0, false);
+				// Give the anim the unit's house so it draws with the house
+				// remap palette (AnimClass::Owner = "used for remap"). Without
+				// this the deploy animation renders magenta/pink.
+				pAnim->SetOwnerObject(pUnit);
+				pAnim->Owner = pUnit->Owner;
+				const int rate = pAnimType->Rate > 0 ? pAnimType->Rate : 1;
+				dur = pAnimType->End > 0 ? pAnimType->End * rate : 30;
+				if (dur < 15) dur = 15;
+				if (dur > 120) dur = 120;
+			}
+
+			BunkerProbe::AddIntent(pUnit, pBld, frame + dur); // hidden = true
+			Debug::Log("[BunkerExt] f%d IntentAnim %s -> %s (centred, %d frames, voxel hidden)\n",
+				frame, BunkerProbe::IdOf(pUnit), pBld->Type->ID, dur);
 		}
 		return 0;
 	}
 
-	// --- Phase A: the ordered unit is deploying on/over the pad. ------------
-	// This hook runs at UnitClass::Update ENTRY, BEFORE the mission/deploy code
-	// runs later in the same frame — so setting Deployed here pre-empts the
-	// engine's CheckRestrictions abort. Let the engine descend it (correct
-	// render); once it has reached the deck, force the deploy complete and
-	// finalize into the bunker, keeping the engine's own deploy facing.
+	// --- Phase A: deploy animation playing on the pad -> hold the (hidden)
+	// unit grounded at centre until the timer elapses, then reveal it as the
+	// deployed form facing South and finalize (link, raise walls over it).
 	if (auto const pIntent = BunkerProbe::FindIntent(pUnit))
 	{
 		auto const pBld = pIntent->bld;
@@ -532,39 +556,24 @@ DEFINE_HOOK(0x7360C0, UnitClass_Update_BunkerExtCapture, 0x5)
 
 		auto const centre = bunkerCentre(pBld);
 
-		if (!pUnit->Deployed)
+		if (frame < pIntent->doneFrame)
 		{
-			// Pin X/Y to the pad centre while it descends (preserve Z so the
-			// descent animates); the engine renders the real chopper lowering.
-			auto pinned = pUnit->GetCoords();
-			pinned.X = centre.X;
-			pinned.Y = centre.Y;
-			if (pUnit->Locomotor)
-				pUnit->Locomotor->Mark_All_Occupation_Bits(MarkType::Up);
-			pUnit->SetLocation(pinned);
-			if (pUnit->Locomotor)
-				pUnit->Locomotor->Mark_All_Occupation_Bits(MarkType::Down);
-
-			// Still airborne / descending -> let it keep coming down.
-			if (pUnit->InAir || pUnit->GetHeight() > 16)
-				return 0;
-
-			// On the deck but the engine won't finish (building cell) -> force
-			// the deploy complete this frame, before the mission code aborts.
-			pUnit->Deployed = true;
-			pUnit->Deploying = false;
-			Debug::Log("[BunkerExt] f%d IntentLanded %s -> %s (forced deploy complete)\n",
-				frame, BunkerProbe::IdOf(pUnit), pBld->Type->ID);
+			groundAt(pUnit, centre); // keep it pinned, voxel stays hidden
+			faceSouth(pUnit);
+			return 0;
 		}
 
-		// Deployed on the pad -> finalize: ground dead-centre (keep the deploy
-		// facing), link, raise walls over the genuinely grounded unit.
+		// Animation finished -> reveal the deployed/siege form, facing South.
+		pIntent->hidden = false;
+		pUnit->Deployed = true;
+		pUnit->Deploying = false;
 		groundAt(pUnit, centre);
+		faceSouth(pUnit);
 		pBld->BunkerLinkedItem = pUnit;
 		pUnit->BunkerLinkedItem = pBld;
 		pBld->TankBunkerState = ::TankBunkerState::Idle;
 		BunkerProbe::RemoveIntent(pUnit);
-		Debug::Log("[BunkerExt] f%d IntentCapture %s -> %s, raising walls\n",
+		Debug::Log("[BunkerExt] f%d IntentReveal %s -> %s, raising walls\n",
 			frame, BunkerProbe::IdOf(pUnit), pBld->Type->ID);
 		pBld->UpdateBunker();
 	}
